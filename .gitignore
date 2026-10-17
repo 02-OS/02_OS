@@ -28,5 +28,6 @@ profile/airootfs/usr/lib/02-agent/BUILD_STAMP
 profile/airootfs/usr/bin/02
 profile/airootfs/usr/bin/02-agentd
 profile/airootfs/usr/bin/02agent
+profile/airootfs/usr/local/share/02os/browser-repo/
 
 

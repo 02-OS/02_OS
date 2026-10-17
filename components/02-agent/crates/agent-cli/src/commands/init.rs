@@ -23,11 +23,12 @@ fn run(json_output: bool, print_human: bool) -> Result<()> {
     let db_path = StoragePaths::repo_db_path(&repo_info.id)?;
 
     let mut db = IndexDatabase::open(&db_path)?;
-    db.update_repo_info(&repo_info)?;
+    db.note_repo_presence(&repo_info)?;
 
     // Create .02agent/config.toml if not present
     let config = RepoConfig::load_or_default(&repo_root);
     config.save_to_repo(&repo_root)?;
+    let watching = crate::commands::watch::register_automatic(&repo_root)?;
 
     if json_output {
         let out = json!({
@@ -39,6 +40,7 @@ fn run(json_output: bool, print_human: bool) -> Result<()> {
             "db_path": db_path,
             "branch": repo_info.branch,
             "head_commit": repo_info.head_commit,
+            "watching": watching,
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else if print_human {

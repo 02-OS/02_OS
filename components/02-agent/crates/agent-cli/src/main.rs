@@ -27,6 +27,12 @@ enum Commands {
     #[command(about = "Show repository indexing status, Git HEAD, and health")]
     Status,
 
+    #[command(about = "Enable background indexing for the current repository")]
+    Watch,
+
+    #[command(about = "Disable background indexing until explicitly re-enabled")]
+    Unwatch,
+
     #[command(about = "Scan repository files and update the local SQLite FTS5 index")]
     Index {
         #[arg(long, help = "Force a complete re-index of the entire repository")]
@@ -176,6 +182,8 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Commands::Init => commands::init::execute(cli.json),
         Commands::Status => commands::status::execute(cli.json),
+        Commands::Watch => commands::watch::execute(true, cli.json),
+        Commands::Unwatch => commands::watch::execute(false, cli.json),
         Commands::Index { full } => commands::index::execute(full, cli.json),
         Commands::Add {
             source,

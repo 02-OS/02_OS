@@ -1,6 +1,7 @@
 """Fresh releases pick the ISO this run wrote; --reuse-iso stays strict."""
 import os
 import shlex
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -26,19 +27,35 @@ class ReleaseIsoSelectionTests(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self.out = self.root / "out"
         self.out.mkdir()
-        self.head = git_head()
+        scripts = self.root / "scripts"
+        scripts.mkdir()
+        for name in ("release.sh", "iso-manifest.py", "source-manifest.py"):
+            shutil.copy2(ROOT / "scripts" / name, scripts / name)
+        self.release = scripts / "release.sh"
+        self.manifest = scripts / "iso-manifest.py"
+        self.source = self.out / "source.json"
+        (self.root / ".gitignore").write_text("out/\nbuild.sh\n__pycache__/\n")
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Fixture",
+                        "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"], check=True)
+        self.head = subprocess.check_output(["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True).strip()
+        subprocess.run(["python3", str(scripts / "source-manifest.py"), str(self.root),
+                        "--output", str(self.source)], check=True)
 
     def tearDown(self):
         self._tmp.cleanup()
 
     def complete(self, iso):
-        subprocess.run(["python3", str(MANIFEST), "create", str(iso), self.head],
+        subprocess.run(["python3", str(self.manifest), "create", str(iso), self.head,
+                        "--source-manifest", str(self.source)],
                        check=True, capture_output=True, timeout=10)
 
     def write_stub(self, body, complete=None):
         if complete:
-            body += (f'python3 {shlex.quote(str(MANIFEST))} create '
-                     f'"${{OUT_DIR}}/{complete}" {shlex.quote(self.head)}\n')
+            body += (f'python3 {shlex.quote(str(self.manifest))} create '
+                     f'"${{OUT_DIR}}/{complete}" {shlex.quote(self.head)} '
+                     f'--source-manifest {shlex.quote(str(self.source))}\n')
         stub = self.root / "build.sh"
         stub.write_text("#!/bin/bash\nset -euo pipefail\n" + body)
         stub.chmod(0o755)
@@ -50,8 +67,8 @@ class ReleaseIsoSelectionTests(unittest.TestCase):
         env["RELEASE_OUT_DIR"] = str(self.out)
         env["RELEASE_BUILD_SCRIPT"] = str(stub)
         return subprocess.run(
-            ["bash", str(RELEASE), *args],
-            cwd=ROOT,
+            ["bash", str(self.release), *args],
+            cwd=self.root,
             env=env,
             capture_output=True,
             text=True,
@@ -80,6 +97,27 @@ class ReleaseIsoSelectionTests(unittest.TestCase):
         self.assertEqual(new.read_text(), "new-image\n")
         self.assertEqual((self.out / (new.name + ".commit")).read_text().strip(), self.head)
         self.assertTrue(old.is_file(), "older ISO must be left in place")
+
+    def test_release_rejects_dirty_source_before_calling_builder(self):
+        (self.root / "new-source.rs").write_text("fn changed() {}\n")
+        stub = self.write_stub('echo BUILDER_WAS_CALLED\n')
+        result = self.run_release(stub)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("clean source checkout", result.stderr)
+        self.assertNotIn("BUILDER_WAS_CALLED", result.stdout)
+
+    def test_reuse_rejects_dirty_build_provenance_for_identical_bytes(self):
+        import json
+        iso = self.out / "02_OS-2099.10.06-x86_64.iso"
+        iso.write_bytes(b"image")
+        self.complete(iso)
+        path = Path(str(iso) + ".manifest.json")
+        manifest = json.loads(path.read_text())
+        manifest["source"]["dirty"] = True
+        path.write_text(json.dumps(manifest))
+        result = self.run_release(self.write_stub('exit 99\n'), "--reuse-iso")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("source snapshot", result.stderr)
 
     def test_fresh_build_selects_new_iso_among_two_older_ones(self):
         for name in ("02_OS-2099.10.04-x86_64.iso", "02_OS-2099.10.05-x86_64.iso"):

@@ -172,6 +172,19 @@ prepare_work_dir() {
   # Validation is finished. Nothing above creates, deletes, or chowns.
   _work_dir_assert_mutable "${canonical}" "${home_canon}"
 
+  # The lock lives outside the reclaimed tree and is shared by all checkouts.
+  # Keep fd 8 open for the caller's entire build, not just directory preparation.
+  local work_lock="${canonical}.02os-lock"
+  if [[ -L "${work_lock}" || ( -e "${work_lock}" && ! -f "${work_lock}" ) ]]; then
+    echo "ERROR: refusing non-regular work-directory lock ${work_lock}." >&2
+    return 1
+  fi
+  exec 8>>"${work_lock}"
+  if ! flock -n 8; then
+    echo "ERROR: another build owns work directory ${canonical}." >&2
+    return 1
+  fi
+
   marker="${canonical}.02os-marker"
   if [[ -L "${marker}" ]]; then
     echo "ERROR: refusing symlink marker ${marker}." >&2

@@ -1,6 +1,6 @@
+import {motionEnabled} from './motionPreference.js';
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
-import St from 'gi://St';
 
 import {Easing, sampleRamp} from '../motion/catalog.js';
 import {OVERSHOOT_RESERVE, fitHoverLevel, hoverActive, waveFalloff, waveGeometry} from '../motion/continuum.js';
@@ -27,7 +27,7 @@ export class MotionSurface {
         recipe,
         clock = () => GLib.get_monotonic_time() / 1000,
         getPointer = () => global.get_pointer().slice(0, 2),
-        animationsEnabled = () => St.Settings.get().enable_animations,
+        animationsEnabled = () => motionEnabled(),
         onUrgentChanged = () => {},
         scheduler,
     }) {
@@ -175,6 +175,7 @@ class WaveRow {
     #recipe;
     #scheduler;
     #translations = new Map();
+    #disposed = false;
 
     constructor({scheduler, box, edge, recipe, clock, getPointer, animationsEnabled, context}) {
         const {pointerActor, background} = context;
@@ -270,6 +271,9 @@ class WaveRow {
     }
 
     dispose() {
+        if (this.#disposed)
+            return;
+        this.#disposed = true;
         this.#pointerActor.disconnectObject(this);
         this.#box.disconnectObject(this);
         this.#restoreSpacing();
@@ -286,7 +290,7 @@ class WaveRow {
     }
 
     #scheduleFlush() {
-        if (this.#flushId)
+        if (this.#disposed || this.#flushId)
             return;
         this.#flushId = this.#scheduler.schedule(() => this.#flush());
     }
@@ -301,6 +305,8 @@ class WaveRow {
     // Swap before applying: an apply can schedule the next flush.
     #flush() {
         this.#flushId = 0;
+        if (this.#disposed)
+            return;
         if (hoverActive(this.#recipe.hover))
             this.#syncWave();
         const dirty = this.#dirty;
@@ -475,9 +481,9 @@ class WaveRow {
         }
         for (const [actor, original] of this.#translations) {
             if (!actors.includes(actor)) {
-                actor[property] = original;
-                actor.disconnectObject(this);
                 this.#translations.delete(actor);
+                actor.disconnectObject(this);
+                actor[property] = original;
             }
         }
         for (const actor of actors) {
@@ -504,8 +510,11 @@ class WaveRow {
         this.#background?.setGrowth(0);
         const property = this.#horizontal ? 'translation_x' : 'translation_y';
         for (const [actor, original] of this.#translations) {
-            actor[property] = original;
+            this.#translations.delete(actor);
             actor.disconnectObject(this);
+            // Restoring a translation emits notify and can destroy this
+            // actor synchronously. Disconnect before the final actor access.
+            actor[property] = original;
         }
         this.#translations.clear();
     }

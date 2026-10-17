@@ -37,6 +37,7 @@ pub fn execute(json_output: bool) -> Result<()> {
 
     // 4. Live ISO check
     let live_env = LiveEnvironmentInfo::detect();
+    let daemon_available = crate::commands::watch::daemon_available();
 
     // 5. Current repository check
     let current_dir = env::current_dir()?;
@@ -50,6 +51,10 @@ pub fn execute(json_output: bool) -> Result<()> {
             Some((info, initialized, db_path))
         });
 
+    let watching = repo_check
+        .as_ref()
+        .map(|(info, _, _)| crate::commands::watch::watching(&info.root_path))
+        .transpose()?;
     if json_output {
         let out = json!({
             "is_root": is_root,
@@ -58,6 +63,8 @@ pub fn execute(json_output: bool) -> Result<()> {
             "storage_writable": storage_writable,
             "live_environment": live_env,
             "in_repository": repo_check.is_some(),
+            "watching": watching,
+            "daemon_available": daemon_available,
             "repository": repo_check.map(|(info, init, db)| json!({
                 "id": info.id.as_str(),
                 "name": info.name,
@@ -103,6 +110,15 @@ pub fn execute(json_output: bool) -> Result<()> {
 
         println!();
         println!("Repository Context:");
+        println!(
+            "  • Background Watch: {:?}; daemon {}",
+            watching,
+            if daemon_available {
+                "available"
+            } else {
+                "stopped"
+            }
+        );
         if let Some((info, initialized, db_path)) = repo_check {
             println!("  • Detected Repo:    {}", info.name);
             println!("  • Path:             {}", info.root_path.display());

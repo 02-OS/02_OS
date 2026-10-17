@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "agent-context",
  "agent-core",
+ "agent-daemon",
  "agent-git",
  "agent-index",
  "agent-mcp",
@@ -103,6 +104,7 @@ dependencies = [
  "chrono",
  "hex",
  "ignore",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

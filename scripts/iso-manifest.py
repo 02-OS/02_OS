@@ -8,6 +8,14 @@ from pathlib import Path
 import stat
 import sys
 import tempfile
+import importlib.util
+
+
+def source_snapshot(root):
+    spec = importlib.util.spec_from_file_location("build_source_manifest", Path(__file__).with_name("source-manifest.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.snapshot(root, require_clean=True)
 
 
 def image_identity(path):
@@ -46,13 +54,25 @@ def main():
     parser.add_argument("action", choices=("create", "verify"))
     parser.add_argument("iso", type=Path)
     parser.add_argument("revision")
+    parser.add_argument("--source-manifest", type=Path)
+    parser.add_argument("--source-root", type=Path)
+    parser.add_argument("--packages", type=Path)
     args = parser.parse_args()
     manifest_path = Path(str(args.iso) + ".manifest.json")
     commit_path = Path(str(args.iso) + ".commit")
     try:
         if args.action == "create":
-            manifest = {"schema_version": 1, "revision": args.revision,
+            manifest = {"schema_version": 2, "revision": args.revision,
                         **image_identity(args.iso)}
+            if args.source_manifest:
+                source = json.loads(args.source_manifest.read_text())
+                if source["revision"] != args.revision:
+                    raise ValueError("source snapshot revision differs from ISO revision")
+                manifest["source"] = {key: source[key] for key in ("revision", "dirty", "source_sha256")}
+            if args.packages:
+                manifest["packages"] = args.packages.read_text().splitlines()
+                if not manifest["packages"]:
+                    raise ValueError("package inventory is empty")
             # The manifest is the completion boundary; a failed build never
             # publishes it. Keep the old revision sidecar for existing tools.
             atomic_write(commit_path, args.revision + "\n")
@@ -63,10 +83,15 @@ def main():
             if not manifest_path.is_file():
                 raise ValueError("ISO has no completion manifest; rebuild before release")
             manifest = json.loads(manifest_path.read_text())
-            if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
+            if not isinstance(manifest, dict) or manifest.get("schema_version") != 2:
                 raise ValueError("invalid ISO completion manifest")
             if manifest.get("revision") != args.revision:
                 raise ValueError("ISO manifest revision does not match HEAD")
+            if args.source_root:
+                current = source_snapshot(args.source_root)
+                source = manifest.get("source", {})
+                if source.get("dirty") is not False or source.get("source_sha256") != current["source_sha256"]:
+                    raise ValueError("ISO source snapshot does not match the clean release checkout; rebuild")
             actual = image_identity(args.iso)
             if any(manifest.get(key) != value for key, value in actual.items()):
                 raise ValueError("ISO content does not match its completion manifest (size/SHA-256)")

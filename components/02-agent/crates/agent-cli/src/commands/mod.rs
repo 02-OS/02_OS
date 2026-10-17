@@ -16,3 +16,4 @@ pub mod serve;
 pub mod status;
 pub mod symbol;
 pub mod tests;
+pub mod watch;

@@ -27,16 +27,81 @@ def _read_installed_packages(path):
 
 class Plugin:
     def on_install(self, installation):
+        # Plymouth owns /etc/plymouth/plymouthd.conf. Install it before the
+        # provisioner writes our configuration, avoiding an unowned-file conflict.
+        installation.add_additional_packages(["plymouth"])
         self._provision(installation)
         self._prepare_boot(installation)
         self._configure_boot_branding(installation)
-        installation.add_additional_packages(["plymouth"])
         self._activate_theme(installation)
 
     def on_genfstab(self, installation):
         self._install_desktop_packages(installation)
         self._provision(installation)
+        installation.arch_chroot("/usr/local/bin/02os-check-desktop")
+        # The desktop and its official dependencies are installed by this point.
+        # Run inside the target so browser payloads and dependency transactions
+        # cannot accidentally install into the live system instead.
+        self._install_browsers(installation)
         self._activate_theme(installation)
+
+    def _install_browsers(self, installation):
+        import subprocess
+
+        helper = "/usr/local/bin/02os-install-browsers"
+        target = str(installation.target)
+        # This query reads only the manifest and target package database. A
+        # repeated final hook must not restore hundreds of MB of spent payload.
+        result = subprocess.run(["arch-chroot", "-S", target, helper, "--verify-only"], check=False)
+        if result.returncode != 0:
+            subprocess.check_call(["/usr/local/bin/02os-provision", "--browser-payload", target])
+            installation.arch_chroot(helper)
+        # A failed query/stage/transaction leaves payload available for diagnosis.
+        # Cleanup occurs only after the exact installed versions are confirmed.
+        self._cleanup_browser_payload(installation)
+
+    def _cleanup_browser_payload(self, installation):
+        import hashlib
+        import json
+        from pathlib import Path
+        import re
+
+        target = Path(str(installation.target)).resolve()
+        if target == Path("/"):
+            raise RuntimeError("Refusing to clean browser payload in the live system")
+        repo = target / "usr/local/share/02os/browser-repo"
+        manifest_path = repo / "manifest.json"
+        if repo.resolve() != repo or manifest_path.is_symlink():
+            raise RuntimeError("Refusing to clean browser payload through a symlink")
+        manifest = json.loads(manifest_path.read_text())
+        repository = manifest["repository"]
+        files = [(package["filename"], package["sha256"]) for package in manifest["packages"]]
+        files.extend((repository[name], repository[digest]) for name, digest in (
+            ("filename", "sha256"), ("database_filename", "database_sha256")))
+        owned = []
+        # Validate every candidate before removing any file. Unrelated package
+        # caches, source payload and files placed alongside the repo stay intact.
+        for name, expected in files:
+            if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_\-]*", name):
+                raise RuntimeError("Invalid browser payload filename during cleanup")
+            if name == "manifest.json" or not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+                raise RuntimeError("Invalid browser payload manifest during cleanup")
+            path = repo / name
+            if path.is_symlink():
+                raise RuntimeError(f"Refusing to remove browser payload symlink: {name}")
+            if not path.exists():
+                continue
+            if not path.is_file():
+                raise RuntimeError(f"Refusing to remove browser payload directory: {name}")
+            digest = hashlib.sha256()
+            with path.open("rb") as payload:
+                for chunk in iter(lambda: payload.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != expected:
+                raise RuntimeError(f"Browser payload changed; preserving files for diagnosis: {name}")
+            owned.append(path)
+        for path in owned:
+            path.unlink()
 
     def _prepare_boot(self, installation):
         # archinstall's own Plymouth integration uses these installer-owned

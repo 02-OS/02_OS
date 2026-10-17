@@ -170,15 +170,23 @@ components/02-agent/
 - **Binary**: `02-agentd`, packaged as a systemd user service (`02-agentd.service`).
 - **IPC Transport**: Unix domain socket located at `$XDG_RUNTIME_DIR/02agent.sock` with restrictive `0600` permissions.
 - **Security Check**: Warns when started as root and keeps running. The socket is mode `0600`, storage directories are mode `0700`, and each accepted connection must present the daemon user's `SO_PEERCRED` uid.
-- **Repo Watcher**: Monitors registered repositories (`watched_repos.json`). When HEAD or the worktree fingerprint changes, it runs the same single-scan index path as `02 index` and logs sync failures.
+- **Repo Watcher**: Monitors automatically registered repositories (`watched_repos.json`), preserving explicit opt-outs. It compares HEAD, eligible file content hashes, and configuration with successful-index state, reconciles once on startup, and logs/retries sync failures. Index writers use an adjacent file lock across the complete pipeline, including memory evaluation, before publishing completion.
 
 ---
 
 ## 3. SQLite Storage Schema
 
-All index metadata is stored in `~/.local/share/02-agent/repos/<repo-id>/index.sqlite`. The database is schema version 3. Existing v1/v2 catalogs upgrade in place; references without caller IDs are re-extracted on the next index or cognify run. The statements below match `components/02-agent/crates/agent-index/src/schema.rs`.
+All index metadata is stored in `~/.local/share/02-agent/repos/<repo-id>/index.sqlite`. The database is schema version 4. Existing v1/v2/v3 catalogs upgrade in place; references without caller IDs are re-extracted on the next index or cognify run. Legacy catalogs have no completed-index marker until their next successful index. Observing a repository updates its identity without certifying its content. The statements below match `components/02-agent/crates/agent-index/src/schema.rs`.
 
 ```sql
+CREATE TABLE IF NOT EXISTS completed_index_state (
+    repo_id TEXT PRIMARY KEY,
+    head_commit TEXT,
+    fingerprint TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    FOREIGN KEY(repo_id) REFERENCES repositories(repo_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     repo_id TEXT NOT NULL,

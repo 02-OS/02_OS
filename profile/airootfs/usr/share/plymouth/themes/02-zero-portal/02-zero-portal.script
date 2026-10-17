@@ -3,7 +3,7 @@
 # Refresh ticks never advance this timeline, so slow rendering cannot stretch it.
 Window.SetBackgroundTopColor(249 / 255, 249 / 255, 247 / 255);
 Window.SetBackgroundBottomColor(249 / 255, 249 / 255, 247 / 255);
-Plymouth.SetRefreshRate(30);
+Plymouth.SetRefreshRate(60);
 
 global.intro_duration = 0.25;
 global.epoch = -1;
@@ -31,10 +31,11 @@ prompt_sprite.SetOpacity(0);
 entry_sprite.SetOpacity(0);
 message_sprite.SetOpacity(0);
 
+# Smootherstep. The midpoint stays 0.5, so the elapsed fade check is unchanged.
 fun smooth(value)
 {
     value = Math.Clamp(value, 0, 1);
-    return value * value * (3 - 2 * value);
+    return value * value * value * (value * (value * 6 - 15) + 10);
 }
 
 fun place_text(sprite, text, y)

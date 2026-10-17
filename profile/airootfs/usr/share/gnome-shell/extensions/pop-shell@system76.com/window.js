@@ -7,6 +7,7 @@ import * as utils from './utils.js';
 import * as xprop from './xprop.js';
 import * as scheduler from './scheduler.js';
 import * as focus from './focus.js';
+import * as Maximization from './maximization.js';
 import Gdk from 'gi://Gdk';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
@@ -261,7 +262,7 @@ export class ShellWindow {
         const actor = meta.get_compositor_private();
         if (actor) {
             if (this.is_maximized()) {
-                meta.unmaximize(Meta.MaximizeFlags.BOTH);
+                Maximization.unmaximize(meta);
             }
             actor.remove_all_transitions();
             ext.movements.insert(this.entity, clone);

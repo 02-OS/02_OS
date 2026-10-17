@@ -1,6 +1,6 @@
+import {motionEnabled} from './motionPreference.js';
 import Clutter from 'gi://Clutter';
 import GObject from 'gi://GObject';
-import St from 'gi://St';
 
 import {ScreenEdge, sampleRamp} from '../motion/catalog.js';
 import {
@@ -313,7 +313,7 @@ export class IconMotionController {
     }
 
     #apply(now = this.#clock()) {
-        const animationsEnabled = St.Settings.get().enable_animations;
+        const animationsEnabled = motionEnabled();
         const transform = resolveIconTransform({
             edge: this.#edge,
             recipe: this.#recipe,

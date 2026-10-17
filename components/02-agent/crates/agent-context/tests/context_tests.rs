@@ -107,6 +107,11 @@ fn test_context_compiler_full_pipeline() {
     }
     db.save_symbols_and_references(&repo_id, &symbols, &references)
         .unwrap();
+    db.complete_index(
+        &repo_info,
+        &RepoScanner::scan_fingerprint(&scanned, &RepoConfig::default()),
+    )
+    .unwrap();
 
     // 4. Save evidence memory
     let store = MemoryStore::for_repo(&repo_id).unwrap();

@@ -44,8 +44,19 @@ repositories, and never run the installer or root customization.
 - Named dataset ingestion, repeated text ingestion, and JSON/DOT exports.
 - Nonzero errors outside a repository.
 - Shell and Python syntax, package manifest consistency, SVG/schema XML,
-  strict GLib schema compilation, desktop entries, executable permission
+  strict GLib schema and dconf database compilation, desktop entries, executable permission
   mappings, and the runtime alias.
+- Browser verification without a transaction, target-only archive staging,
+  success cleanup, failure retention, repeated hooks, and symlink rejection.
+- Pop Shell title changes on Wayland/X11 and maximization API contracts for
+  the declared GNOME versions, using semantic API fixtures.
+- Build profile copying with bytecode exclusion, preserved offline payload,
+  symlink and work-directory guards, and concurrent build rejection.
+- Greeter account filtering and the live boot dependency ordering.
+- Completed-index state, repeat initialization, untracked content, nested ignores,
+  daemon startup after automatic registration, and persistent watch opt-outs.
+- Actual-source build manifests, cross-checkout work locking, clean-release
+  provenance, and GNOME/Mutter/Archinstall compatibility rejection.
 
 These checks complement the existing workspace tests. They are not evidence
 that an ISO boots or that an installed system works.
@@ -111,3 +122,9 @@ scripts once a dedicated runner is available. Add a periodic full VM run to
 catch rolling Arch package changes, and require the complete VM suite before
 publishing a release. Add dependency-advisory and secret scanners as separate
 jobs with a documented policy for exceptions.
+
+The repository-owned Docker/QEMU acceptance runner is documented in
+[`scripts/vm/README.md`](../scripts/vm/README.md). It creates standalone test
+disks, verifies ISO completion manifests, captures native screenshots and audio,
+and checks the sole guest disk's serial/size before invoking the supported
+installer. BIOS live boots and UEFI installation are separate recorded runs.

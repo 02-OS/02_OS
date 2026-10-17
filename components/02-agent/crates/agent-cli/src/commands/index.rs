@@ -26,15 +26,8 @@ pub fn execute(full: bool, json_output: bool) -> Result<()> {
     let registry = TaskRegistry::new();
     let added = index_pipeline(&mut handle, full, &registry)?;
 
-    let store = agent_memory::MemoryStore::for_repo(&handle.info.id)?;
-    let staleness_report = agent_memory::StalenessEngine::evaluate(
-        &repo_root,
-        &handle.info.id,
-        &handle.git,
-        &handle.db,
-        &store,
-    )
-    .ok();
+    let staleness_report = &added.staleness;
+    let watching = crate::commands::watch::register_automatic(&repo_root)?;
     let elapsed = start.elapsed();
     let stats = handle.db.get_stats(&handle.info.id)?;
     let head_commit = handle.info.head_commit.clone();
@@ -53,6 +46,7 @@ pub fn execute(full: bool, json_output: bool) -> Result<()> {
             "duration_ms": elapsed.as_millis(),
             "head_commit": head_commit,
             "staleness": staleness_report,
+            "watching": watching,
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {

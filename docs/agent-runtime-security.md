@@ -41,15 +41,20 @@ Developers can audit their repository at any time:
 
 ### Non-Root Enforcement
 
-`02-agentd` is a user service. If it is started as UID 0 it prints a warning and continues. It does not exit solely because the uid is root. Socket mode `0600`, directory mode `0700`, and `SO_PEERCRED` still limit who can connect.
+`02-agentd` is a user service. Its packaged unit excludes system accounts and GDM greeters. If the binary is started directly as UID 0 it prints a warning and continues. It does not exit solely because the uid is root. Socket mode `0600`, directory mode `0700`, and `SO_PEERCRED` still limit who can connect.
 
 ### Systemd User Sandboxing
 
 In **02_OS**, `02-agentd` is managed as an unprivileged user service (`02-agentd.service`) under `systemd --user`:
 
 ```ini
+[Unit]
+ConditionUser=!@system
+ConditionUser=!gdm-greeter
+
 [Service]
 Type=simple
+ExecCondition=/usr/bin/sh -c 'case "$$1" in gdm|gdm-greeter|gdm-greeter-*) exit 1 ;; *) exit 0 ;; esac' sh %u
 ExecStartPre=+/usr/lib/02-agent/prepare-storage.sh
 ExecStart=/usr/bin/02-agentd
 Restart=on-failure
@@ -65,6 +70,7 @@ NoNewPrivileges=true
 - **`ProtectSystem=strict`**: Mounts the whole file system read-only, including `$HOME`. `ProtectHome=no` does not undo that.
 - **`ExecStartPre=+/usr/lib/02-agent/prepare-storage.sh`**: The `+` prefix skips the sandbox and creates the data, cache, and config directories (mode `0700`) before the daemon starts. Those paths honor `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_CONFIG_HOME`, with the usual defaults under `~/.local/share`, `~/.cache`, and `~/.config`. A missing directory is not papered over with a `-` prefix on `ReadWritePaths`.
 - **`ProtectHome=no` and `ReadWritePaths=%h`**: Home stays visible and writable so repositories there can be indexed. Data, cache, config, and `%t` are listed as well. A user generator adds `ReadWritePaths` when those XDG directories sit outside `$HOME`.
+- **Account checks**: The unit filters system UIDs and static/dynamic GDM greeter names. It does not order itself after the target that enables it.
 - **`NoNewPrivileges=true`**: Disallows gaining new privileges via `setuid` binaries.
 
 ---

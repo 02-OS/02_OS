@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 from icons_apps import get_app_icons
+from icons_browsers import BROWSER_ICON_ALIASES, get_browser_icons
 from icons_places import get_places_icons
 from icons_devices_categories import get_devices_icons, get_categories_icons, get_mimetypes_icons
 from icons_status_actions import get_status_icons, get_actions_icons
@@ -138,6 +139,21 @@ def squircle_card(bg_id, inner_art):
   <rect x="36" y="36" width="440" height="440" rx="104" ry="104" fill="none" stroke="url(#specular-rim)" stroke-width="2.5"/>
 """
 
+def generate_browser_icons_at(base_dir):
+    """Update only browser art and aliases, preserving all other theme files."""
+    apps_dir = os.path.join(base_dir, "scalable", "apps")
+    os.makedirs(apps_dir, exist_ok=True)
+    for name, (defs, background, art) in get_browser_icons().items():
+        path = os.path.join(apps_dir, f"{name}.svg")
+        with open(path, "w") as icon:
+            icon.write(wrap_svg(defs, squircle_card(background, art)))
+    for name, target in BROWSER_ICON_ALIASES.items():
+        path = os.path.join(apps_dir, name)
+        if os.path.lexists(path):
+            os.remove(path)
+        os.symlink(target, path)
+    print(f"Generated Chrome and Brave icons at: {apps_dir}")
+
 def generate_theme_at(base_dir):
     print(f"Generating 02-OS theme at: {base_dir}")
     os.makedirs(base_dir, exist_ok=True)
@@ -171,6 +187,7 @@ def generate_theme_at(base_dir):
 
     # Symlinks for Apps
     app_symlinks = {
+        **BROWSER_ICON_ALIASES,
         "start-here.svg": "02os-menu.svg",
         "distributor-logo.svg": "02os-logo.svg",
         "archlinux-logo.svg": "02os-logo.svg",
@@ -341,7 +358,10 @@ def main():
     failed = []
     for target in TARGET_PATHS:
         try:
-            generate_theme_at(target)
+            if "--browsers-only" in sys.argv:
+                generate_browser_icons_at(target)
+            else:
+                generate_theme_at(target)
         except Exception as err:
             failed.append(target)
             print(f"Error generating at {target}: {err}", file=sys.stderr)

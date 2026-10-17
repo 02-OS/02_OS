@@ -14,7 +14,7 @@ use agent_core::{
     AgentError, Result,
 };
 use agent_git::GitRepo;
-use agent_index::IndexDatabase;
+use agent_index::{IndexDatabase, RepoScanner};
 use agent_memory::{MemoryStore, StalenessEngine};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -62,11 +62,17 @@ impl ContextCompiler {
             &head_commit_str
         };
 
-        let staleness_str = if diff_files.is_empty() {
-            format!("fresh against HEAD ({})", short_head)
+        let completed = db.completed_index(repo_id)?;
+        let index_fresh = completed.is_some_and(|state| {
+            state.head_commit == repo_info.head_commit
+                && state.fingerprint
+                    == RepoScanner::new(root, RepoConfig::load_or_default(root)).fingerprint()
+        });
+        let staleness_str = if index_fresh {
+            format!("fresh against indexed snapshot ({})", short_head)
         } else {
             format!(
-                "working tree dirty against HEAD ({}) [{} modified files]",
+                "index stale against HEAD ({}) [{} modified tracked files]; run 02 index",
                 short_head,
                 diff_files.len()
             )

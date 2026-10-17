@@ -1,3 +1,4 @@
+import {motionEnabled} from './motionPreference.js';
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import Shell from 'gi://Shell';
@@ -103,7 +104,7 @@ export class LaunchEngine {
         }
 
         if (this.#sessions.has(target) ||
-            !St.Settings.get().enable_animations)
+            !motionEnabled())
             return;
 
         const visibility = this.#getDockContext(appIcon)?.visibility;

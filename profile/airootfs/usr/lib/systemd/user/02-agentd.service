@@ -1,13 +1,14 @@
 [Unit]
 Description=02 Agent Runtime Daemon (Repository Intelligence & MCP Service)
 Documentation=https://github.com/csy20/02_OS
-After=default.target
 # GDM 50 creates a transient greeter account with no writable user home.
 # The repository daemon belongs to signed-in users, not the login screen.
+ConditionUser=!@system
 ConditionUser=!gdm-greeter
 
 [Service]
 Type=simple
+ExecCondition=/usr/bin/sh -c 'case "$$1" in gdm|gdm-greeter|gdm-greeter-*) exit 1 ;; *) exit 0 ;; esac' sh %u
 # '+' skips ProtectSystem so the directories exist before the sandbox.
 ExecStartPre=+/usr/lib/02-agent/prepare-storage.sh
 ExecStart=/usr/bin/02-agentd

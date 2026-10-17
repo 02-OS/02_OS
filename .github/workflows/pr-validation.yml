@@ -19,12 +19,23 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - name: Install profile validators
-        run: sudo apt-get update && sudo apt-get install -y desktop-file-utils libglib2.0-bin
+        run: sudo apt-get update && sudo apt-get install -y desktop-file-utils libglib2.0-bin dconf-cli gnupg
       - name: Validate scripts, packages, permissions, desktop entries, and assets
         run: python3 -m unittest discover -s scripts/tests -p test_os_profile.py -v
       - name: Validate bundled desktop extension imports
         run: python3 -m unittest discover -s scripts/tests -p test_dash_to_dock_imports.py -v
+      - name: Validate desktop API compatibility, service startup, and safe build inputs
+        env:
+          PYTHONPATH: scripts/tests
+        run: python3 -m unittest test_desktop_compatibility test_desktop_gate test_service_startup test_build_profile test_build_provenance test_prepare_work_dir test_staged_runtime test_dconf_snapshot test_vm_acceptance -v
+      - name: Validate browser package verification and installation
+        run: python3 -m unittest discover -s scripts/tests -p 'test_browser*.py' -v
+      - name: Validate installed boot and browser provisioning hooks
+        run: python3 -m unittest discover -s scripts/tests -p test_installed_boot.py -v
 
   runtime-smoke:
     runs-on: ubuntu-latest
@@ -33,7 +44,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install regression validators
-        run: sudo apt-get update && sudo apt-get install -y desktop-file-utils libglib2.0-bin dconf-cli
+        run: sudo apt-get update && sudo apt-get install -y desktop-file-utils libglib2.0-bin dconf-cli gnupg
       - name: Build actual CLI and daemon with locked dependencies
         run: cargo build --locked --workspace --manifest-path components/02-agent/Cargo.toml
       - name: Exercise all profile, installer, release and runtime regressions

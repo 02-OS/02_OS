@@ -178,6 +178,7 @@ pub struct AddReport {
     pub files_updated: usize,
     pub datapoints_inserted: usize,
     pub datapoints_unchanged: usize,
+    pub staleness: Option<crate::StalenessReport>,
 }
 
 pub struct CognifyReport {
@@ -779,6 +780,15 @@ pub fn add_pipeline(
     request: &AddRequest,
     extra: &TaskRegistry,
 ) -> Result<AddReport> {
+    let _index_lock = handle.db.lock_index()?;
+    handle.info = handle.git.info()?;
+    if request
+        .sources
+        .iter()
+        .any(|source| matches!(source, SourceKind::Worktree | SourceKind::Document))
+    {
+        handle.db.invalidate_index(&handle.info.id)?;
+    }
     let needs_text = request
         .sources
         .iter()
@@ -816,6 +826,7 @@ pub fn add_pipeline(
         files_updated: ctx.files_updated,
         datapoints_inserted: ctx.datapoints_inserted,
         datapoints_unchanged: ctx.datapoints_unchanged,
+        staleness: None,
     })
 }
 
@@ -825,6 +836,9 @@ pub fn cognify_pipeline(
     dataset_name: Option<&str>,
     extra: &TaskRegistry,
 ) -> Result<CognifyReport> {
+    let _index_lock = handle.db.lock_index()?;
+    handle.info = handle.git.info()?;
+    handle.db.invalidate_index(&handle.info.id)?;
     let mut ctx = handle.context(
         dataset_name,
         full,
@@ -849,7 +863,10 @@ pub fn index_pipeline(
     full: bool,
     extra: &TaskRegistry,
 ) -> Result<AddReport> {
-    let report = {
+    let _index_lock = handle.db.lock_index()?;
+    handle.info = handle.git.info()?;
+    handle.db.invalidate_index(&handle.info.id)?;
+    let (mut report, fingerprint) = {
         let mut ctx = handle.context(
             None,
             full,
@@ -860,15 +877,34 @@ pub fn index_pipeline(
         RecordFiles.run(&mut ctx)?;
         run_projection(&mut ctx)?;
         extra.run(&mut ctx)?;
-        AddReport {
-            dataset_id: ctx.dataset.id.clone(),
-            files_updated: ctx.files_updated,
-            datapoints_inserted: ctx.datapoints_inserted,
-            datapoints_unchanged: ctx.datapoints_unchanged,
-        }
+        let fingerprint = RepoScanner::scan_fingerprint(&ctx.scanned, ctx.config);
+        (
+            AddReport {
+                dataset_id: ctx.dataset.id.clone(),
+                files_updated: ctx.files_updated,
+                datapoints_inserted: ctx.datapoints_inserted,
+                datapoints_unchanged: ctx.datapoints_unchanged,
+                staleness: None,
+            },
+            fingerprint,
+        )
     };
     let info = handle.info.clone();
-    handle.db.update_repo_info(&info)?;
+    let store = crate::MemoryStore::for_repo(&info.id)?;
+    report.staleness = Some(crate::StalenessEngine::evaluate(
+        &handle.root,
+        &info.id,
+        &handle.git,
+        &handle.db,
+        &store,
+    )?);
+    // If HEAD moved during this run, retain the catalog but never certify it.
+    if handle.git.info()?.head_commit != info.head_commit {
+        return Err(AgentError::General(
+            "Repository HEAD changed during indexing; retry the index".into(),
+        ));
+    }
+    handle.db.complete_index(&info, &fingerprint)?;
     Ok(report)
 }
 

@@ -82,10 +82,17 @@ export default class FlourishExtension extends Extension {
             });
         }, this);
         // Same recipe, new transform: it depends on the animations setting.
-        St.Settings.get().connectObject('notify::enable-animations', () => {
+        const syncMotion = () => {
             this._dockIntegration.setRecipe(this._recipe);
             this._dashIntegration.setRecipe(this._recipe);
-        }, this);
+            this._launchEngine.disable();
+            this._launchEngine.enable();
+            this._attentionEngine.disable();
+            this._attentionEngine.enable();
+        };
+        St.Settings.get().connectObject('notify::enable-animations', syncMotion, this);
+        if (St.ReducedMotion)
+            St.Settings.get().connectObject('notify::reduced-motion', syncMotion, this);
     }
 
     disable() {

@@ -86,7 +86,7 @@ class OSProfileTests(unittest.TestCase):
             with self.subTest(extension=package["uuid"]):
                 self.assertEqual(metadata["uuid"], package["uuid"])
                 self.assertEqual(metadata.get("version-name", metadata.get("version")), package["version"])
-                self.assertIn("50", metadata["shell-version"])
+                self.assertIn(manifest["target_shell"], metadata["shell-version"])
                 self.assertTrue((ext / package["license_file"]).is_file())
                 self.assertRegex(package["sha256"], r"^[0-9a-f]{64}$")
                 for schema in (ext / "schemas").glob("*.gschema.xml"):
@@ -248,13 +248,21 @@ class OSProfileTests(unittest.TestCase):
         self.assertGreaterEqual(namespace["__archinstall__version__"], gate)
         plugin = namespace["Plugin"]()
         calls = []
+        queries = []
 
         def check_call(argv, **_kwargs):
             calls.append(list(argv))
 
+        def run(argv, **_kwargs):
+            queries.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0)
+
         import subprocess
         original = subprocess.check_call
+        original_run = subprocess.run
         subprocess.check_call = check_call
+        subprocess.run = run
+        plugin._cleanup_browser_payload = lambda _installation: None
         try:
             class Installation:
                 def __init__(self):
@@ -280,6 +288,7 @@ class OSProfileTests(unittest.TestCase):
             plugin.on_genfstab(installation)
         finally:
             subprocess.check_call = original
+            subprocess.run = original_run
         self.assertEqual(
             calls,
             [
@@ -290,7 +299,11 @@ class OSProfileTests(unittest.TestCase):
         desktop_packages = namespace["_read_installed_packages"](namespace["INSTALLED_PACKAGES"])
         self.assertEqual(installation.packages, ["plymouth"] + desktop_packages)
         self.assertEqual(installation._kernel_params, ["root=UUID=installed-root", "quiet", "splash"])
-        self.assertEqual(installation.chroot_calls, ["plymouth-set-default-theme 02-zero-portal"] * 2)
+        self.assertEqual(queries, [["arch-chroot", "-S", "/mnt/02os-target",
+                                    "/usr/local/bin/02os-install-browsers", "--verify-only"]])
+        self.assertEqual(installation.chroot_calls, ["plymouth-set-default-theme 02-zero-portal",
+                                                     "/usr/local/bin/02os-check-desktop",
+                                                     "plymouth-set-default-theme 02-zero-portal"])
         self.assertEqual(installation.initramfs_calls, [["-P"], ["-P"]])
 
     def test_product_name_is_02os(self):
@@ -381,6 +394,7 @@ class OSProfileTests(unittest.TestCase):
         text = unit.read_text()
         self.assertIn("ProtectHome=no", text)
         self.assertNotIn("ProtectHome=read-write", text)
+        self.assertIn("ProtectSystem=strict", text)
         self.assertIn("ExecStartPre=+/usr/lib/02-agent/prepare-storage.sh", text)
         self.assertIn(
             "ReadWritePaths=%h/.local/share/02-agent %h/.cache/02-agent %h/.config/02-agent %t %h",
@@ -416,6 +430,8 @@ class OSProfileTests(unittest.TestCase):
             self.assertEqual((target / "usr/bin/02agent").readlink(), Path("02"))
             self.assertEqual((target / "usr/lib/systemd/user/02-agentd.service").read_text(), "[Service]\n")
             self.assertTrue((target / "etc/systemd/user/default.target.wants/02-agentd.service").is_symlink())
+            for rel in ("usr/lib/02-agent/prepare-storage.sh", "usr/lib/systemd/user-generators/02-agent-storage"):
+                self.assertEqual((target / rel).read_bytes(), (source / rel).read_bytes())
             self.assertEqual((target / "usr/local/bin/pop-launcher").read_text(), "launcher")
             for uuid in EXTENSIONS:
                 ext = target / "usr/share/gnome-shell/extensions" / uuid
@@ -423,9 +439,23 @@ class OSProfileTests(unittest.TestCase):
                 self.assertTrue((ext / "schemas/gschemas.compiled").is_file())
             self.assertEqual((target / "usr/share/gnome-shell/extensions/02-zero-portal@02os/extension.js").read_text(), "portal")
             self.assertEqual((target / "usr/lib/tmpfiles.d/02os-zero-portal.conf").read_bytes(), (OVERLAY / "usr/lib/tmpfiles.d/02os-zero-portal.conf").read_bytes())
-            self.assertEqual((target / "usr/share/applications/02os-install.desktop").read_text(), "desktop")
+            self.assertFalse((target / "usr/share/applications/02os-install.desktop").exists())
+            self.assertFalse((target / "usr/local/bin/02os-install").exists())
             self.assertEqual((target / "usr/lib/02-agent/SOURCE_REVISION").read_text(), "rev\n")
-            self.assertEqual((target / "etc/dconf/db/local.d/00-02os").read_text(), "dconf")
+            installed_defaults = configparser.ConfigParser(interpolation=None)
+            installed_defaults.read(target / "etc/dconf/db/local.d/00-02os")
+            favorites = ast.literal_eval(installed_defaults["org/gnome/shell"]["favorite-apps"])
+            self.assertNotIn("02os-install.desktop", favorites)
+            self.assertIn("org.gnome.Nautilus.desktop", favorites)
+            self.assertIn("org.gnome.Console.desktop", favorites)
+            self.assertIn("google-chrome.desktop", favorites)
+            source_defaults = configparser.ConfigParser(interpolation=None)
+            source_defaults.read(source / "etc/dconf/db/local.d/00-02os")
+            source_favorites = ast.literal_eval(source_defaults["org/gnome/shell"]["favorite-apps"])
+            self.assertEqual(favorites, [entry for entry in source_favorites if entry != "02os-install.desktop"])
+            self.assertIn("02os-install.desktop", (source / "etc/dconf/db/local.d/00-02os").read_text())
+            self.assertNotEqual((target / "etc/dconf/db/local").read_bytes(), b"db")
+            self.assertNotIn(b"02os-install.desktop", (target / "etc/dconf/db/local").read_bytes())
             self.assertEqual((target / "etc/dconf/profile/user").read_text(), "user-db:user\nsystem-db:local\n")
             identity = (OVERLAY / "etc/os-release").read_text()
             self.assertNotIn("Arch Linux", identity)
@@ -470,6 +500,149 @@ class OSProfileTests(unittest.TestCase):
             self.assertIn("required 02_OS file is missing", result.stderr)
             self.assertFalse((bare_target / "usr/bin/02").exists())
             self.assertFalse((bare_target / "usr/share/applications/02os-install.desktop").exists())
+
+    def test_provisioner_stages_browser_archives_only_in_explicit_final_phase(self):
+        provision = OVERLAY / "usr/local/bin/02os-provision"
+        with tempfile.TemporaryDirectory(prefix="02os-browser-copy-") as tmp:
+            source, target = Path(tmp) / "source", Path(tmp) / "target"
+            self._write_provision_fixture(source, include_runtime=True)
+            helper = source / "usr/local/bin/02os-install-browsers"
+            shutil.copyfile(OVERLAY / "usr/local/bin/02os-install-browsers", helper)
+            helper.chmod(0o755)
+            repo = source / "usr/local/share/02os/browser-repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            for name, payload in (("manifest.json", b"manifest"), ("02os-browsers.db", b"database"),
+                                  ("browser.pkg.tar.zst", b"verified package"),
+                                  (".02os-generated-browser-repo", b"source ownership marker")):
+                (repo / name).write_bytes(payload)
+            result = subprocess.run([str(provision), "--source", str(source), "--target", str(target)],
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((target / "usr/local/bin/02os-install-browsers").read_bytes(), helper.read_bytes())
+            self.assertTrue(os.access(target / "usr/local/bin/02os-install-browsers", os.X_OK))
+            installed_repo = target / "usr/local/share/02os/browser-repo"
+            self.assertEqual([path.name for path in installed_repo.iterdir()], ["manifest.json"])
+            result = subprocess.run([str(provision), "--browser-payload", "--source", str(source),
+                                     "--target", str(target)], capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for payload in repo.iterdir():
+                if payload.name == ".02os-generated-browser-repo":
+                    self.assertFalse((installed_repo / payload.name).exists())
+                    self.assertEqual(payload.read_bytes(), b"source ownership marker")
+                    continue
+                self.assertEqual((installed_repo / payload.name).read_bytes(), payload.read_bytes())
+                if payload.name != "manifest.json":
+                    (installed_repo / payload.name).unlink()
+            result = subprocess.run([str(provision), "--source", str(source), "--target", str(target)],
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual([path.name for path in installed_repo.iterdir()], ["manifest.json"])
+            self.assertTrue((repo / "browser.pkg.tar.zst").exists())
+
+    def test_provisioner_requires_browser_helper_and_manifest_before_copying(self):
+        provision = OVERLAY / "usr/local/bin/02os-provision"
+        for missing in ("usr/local/bin/02os-install-browsers", "usr/local/share/02os/browser-repo/manifest.json"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory(prefix="02os-browser-required-") as tmp:
+                source, target = Path(tmp) / "source", Path(tmp) / "target"
+                self._write_provision_fixture(source, include_runtime=True)
+                (source / missing).unlink()
+                result = subprocess.run([str(provision), "--source", str(source), "--target", str(target)],
+                                        capture_output=True, text=True, timeout=30)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("required 02_OS file is missing", result.stderr)
+                self.assertFalse((target / "usr/bin/02").exists())
+
+    def test_provisioner_removes_only_known_live_installer_leftovers(self):
+        provision = OVERLAY / "usr/local/bin/02os-provision"
+        with tempfile.TemporaryDirectory(prefix="02os-installer-cleanup-") as tmp:
+            source, target = Path(tmp) / "source", Path(tmp) / "target"
+            self._write_provision_fixture(source, include_runtime=True)
+            leftovers = ("usr/share/applications/02os-install.desktop", "usr/local/bin/02os-install")
+            for rel in leftovers:
+                path = target / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("old image installer")
+            unrelated = target / "usr/share/applications/my-app.desktop"
+            unrelated.write_text("user application")
+            result = subprocess.run([str(provision), "--source", str(source), "--target", str(target)],
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for rel in leftovers:
+                self.assertFalse((target / rel).exists())
+                self.assertTrue((source / rel).exists())
+            self.assertEqual(unrelated.read_text(), "user application")
+
+    def test_browser_payload_stage_rejects_live_root_and_target_symlink_escape(self):
+        provision = OVERLAY / "usr/local/bin/02os-provision"
+        with tempfile.TemporaryDirectory(prefix="02os-browser-escape-") as tmp:
+            source, target, outside = (Path(tmp) / name for name in ("source", "target", "outside"))
+            self._write_provision_fixture(source, include_runtime=True)
+            outside.mkdir()
+            (outside / "keep.txt").write_text("untouched")
+            repo = target / "usr/local/share/02os/browser-repo"
+            repo.parent.mkdir(parents=True)
+            repo.symlink_to(outside)
+            result = subprocess.run([str(provision), "--browser-payload", "--source", str(source),
+                                     "--target", str(target)], capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("resolves outside the installed target", result.stderr)
+            self.assertEqual([path.name for path in outside.iterdir()], ["keep.txt"])
+            repo.unlink()
+            repo.mkdir()
+            (repo / "02os-browsers.db").symlink_to(outside / "keep.txt")
+            (source / "usr/local/share/02os/browser-repo/02os-browsers.db").write_text("new database")
+            result = subprocess.run([str(provision), "--browser-payload", "--source", str(source),
+                                     "--target", str(target)], capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("resolves outside the installed target", result.stderr)
+            self.assertEqual((outside / "keep.txt").read_text(), "untouched")
+            for root in (source, Path("/")):
+                result = subprocess.run([str(provision), "--browser-payload", "--source", str(source),
+                                         "--target", str(root)], capture_output=True, text=True, timeout=30)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("separate from", result.stderr)
+
+    def test_browser_copy_rejects_in_target_symlinks_before_overwriting_referents(self):
+        provision = OVERLAY / "usr/local/bin/02os-provision"
+        for mode in ([], ["--browser-payload"]):
+            redirects = ["repository", "repository-parent", "manifest", "helper"]
+            if mode:
+                redirects.append("archive")
+            for redirect in redirects:
+                with self.subTest(mode=mode, redirect=redirect), tempfile.TemporaryDirectory(prefix="02os-browser-local-link-") as tmp:
+                    source, target = Path(tmp) / "source", Path(tmp) / "target"
+                    self._write_provision_fixture(source, include_runtime=True)
+                    data = target / "home/user/data"
+                    data.mkdir(parents=True)
+                    repo = target / "usr/local/share/02os/browser-repo"
+                    if redirect == "repository":
+                        destination, referent = repo, data
+                        (data / "manifest.json").write_text("valuable user manifest")
+                    elif redirect == "repository-parent":
+                        destination, referent = repo.parent, data
+                        (data / "browser-repo").mkdir()
+                        (data / "browser-repo/manifest.json").write_text("valuable user manifest")
+                    elif redirect == "manifest":
+                        destination, referent = repo / "manifest.json", data / "notes.json"
+                        referent.write_text("valuable user manifest")
+                    elif redirect == "helper":
+                        destination = target / "usr/local/bin/02os-install-browsers"
+                        referent = data / "helper-notes"
+                        referent.write_text("valuable user helper")
+                    else:
+                        destination, referent = repo / "browser.pkg.tar.zst", data / "package-notes"
+                        referent.write_text("valuable user archive")
+                        (source / "usr/local/share/02os/browser-repo/browser.pkg.tar.zst").write_text("image package")
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.symlink_to(os.path.relpath(referent, destination.parent))
+                    before = {path.relative_to(data): path.read_bytes() for path in data.rglob("*") if path.is_file()}
+                    result = subprocess.run([str(provision), *mode, "--source", str(source), "--target", str(target)],
+                                            capture_output=True, text=True, timeout=30)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("refusing browser destination symlink", result.stderr)
+                    self.assertTrue(destination.is_symlink())
+                    after = {path.relative_to(data): path.read_bytes() for path in data.rglob("*") if path.is_file()}
+                    self.assertEqual(after, before)
 
     def test_provisioner_requires_motion_extensions_before_copying(self):
         provision = OVERLAY / "usr/local/bin/02os-provision"
@@ -566,6 +739,13 @@ class OSProfileTests(unittest.TestCase):
         launcher = source / "usr/local/bin/pop-launcher"
         launcher.parent.mkdir(parents=True)
         launcher.write_text("launcher")
+        (launcher.parent / "02os-install").write_text("live installer")
+        browser_helper = launcher.parent / "02os-install-browsers"
+        shutil.copyfile(OVERLAY / "usr/local/bin/02os-install-browsers", browser_helper)
+        browser_helper.chmod(0o755)
+        browser_repo = source / "usr/local/share/02os/browser-repo"
+        browser_repo.mkdir(parents=True)
+        (browser_repo / "manifest.json").write_text("fixture browser manifest")
         for ext, schema_id in EXTENSIONS.items():
             ext_dir = source / "usr/share/gnome-shell/extensions" / ext
             (ext_dir / "schemas").mkdir(parents=True)
@@ -598,11 +778,15 @@ class OSProfileTests(unittest.TestCase):
             (schema_dir / f"{schema_id}.gschema.xml").write_text(self._schema(schema_id))
         dconf = source / "etc/dconf/db/local.d/00-02os"
         dconf.parent.mkdir(parents=True)
-        dconf.write_text("dconf")
+        dconf.write_bytes((OVERLAY / "etc/dconf/db/local.d/00-02os").read_bytes())
         (source / "etc/dconf/profile").mkdir(parents=True)
         (source / "etc/dconf/profile/user").write_text("user-db:user\nsystem-db:local\n")
         (source / "etc/dconf/db/local").write_bytes(b"db")
         for rel in (
+            "usr/local/bin/02os-check-desktop",
+            "usr/local/share/02os/desktop-compatibility.json",
+            "etc/sysctl.d/99-02os-performance.conf",
+            "etc/systemd/zram-generator.conf",
             "etc/os-release",
             "etc/dconf/profile/gdm",
             "etc/dconf/db/gdm.d/00-02os-branding",
@@ -622,6 +806,10 @@ class OSProfileTests(unittest.TestCase):
         wants = source / "etc/systemd/user/default.target.wants/02-agentd.service"
         wants.parent.mkdir(parents=True)
         wants.symlink_to("../../../../usr/lib/systemd/user/02-agentd.service")
+        (source / "usr/lib/02-agent/prepare-storage.sh").write_text("#!/bin/sh\nexit 0\n")
+        generator = source / "usr/lib/systemd/user-generators/02-agent-storage"
+        generator.parent.mkdir(parents=True)
+        generator.write_text("#!/bin/sh\nexit 0\n")
 
     def _write_forbidden_live_paths(self, source):
         forbidden = [

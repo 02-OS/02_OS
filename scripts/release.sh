@@ -14,6 +14,7 @@ PROFILE_DIR="${REPO_ROOT}/profile"
 OUT_DIR="${RELEASE_OUT_DIR:-${REPO_ROOT}/out}"
 export OUT_DIR
 BUILD_SCRIPT="${RELEASE_BUILD_SCRIPT:-${REPO_ROOT}/build.sh}"
+python3 "${SCRIPT_DIR}/source-manifest.py" "${REPO_ROOT}" --require-clean > /dev/null
 
 REUSE_ISO=0
 FORCE_TAG=0
@@ -74,7 +75,7 @@ select_fresh_iso() {
 
     local head_now
     head_now="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
-    python3 "${SCRIPT_DIR}/iso-manifest.py" verify "${ISO_PATH}" "${head_now}"
+    python3 "${SCRIPT_DIR}/iso-manifest.py" verify "${ISO_PATH}" "${head_now}" --source-root "${REPO_ROOT}"
 
 }
 
@@ -90,7 +91,7 @@ if [[ "${REUSE_ISO}" -eq 1 ]]; then
     fi
     ISO_PATH="${ISO_CANDIDATES[0]}"
     HEAD_NOW="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
-    python3 "${SCRIPT_DIR}/iso-manifest.py" verify "${ISO_PATH}" "${HEAD_NOW}"
+    python3 "${SCRIPT_DIR}/iso-manifest.py" verify "${ISO_PATH}" "${HEAD_NOW}" --source-root "${REPO_ROOT}"
     echo "Reusing ISO ${ISO_PATH} built from ${HEAD_NOW}."
 else
     select_fresh_iso
@@ -188,7 +189,7 @@ This release introduces the **02 Agent Runtime** — an operating-system-level r
   - **Standard MCP Server**: Vendor-neutral JSON-RPC 2.0 interface supporting 15 agent tools (\`02 mcp\`, \`02 connect\`).
   - **Pre-installed Background User Daemon**: \`02-agentd\` enabled via \`systemd --user\`.
 - **Refined GNOME Desktop**:
-  - GNOME Shell 50 + Pop Shell window tiling (\`Super+Y\`).
+  - GNOME Shell 51 + Pop Shell window tiling (\`Super+Y\`).
   - Centered floating Dash-to-Dock with pinned terminal and installer.
   - Custom handcrafted **02-OS Glassmorphic Vector Icon Theme** (70+ scalable SVGs).
   - Precompiled GLib schemas and dconf database for faster boot and minimal RAM footprint.

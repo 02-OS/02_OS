@@ -1,7 +1,7 @@
 # Desktop motion
 
 02_OS uses Dash to Dock 109, Flourish 1.2.0 and Compiz Windows Effect 31 on
-GNOME Shell 50. The packages are vendored in
+GNOME Shell 51. The packages are vendored in
 `profile/airootfs/usr/share/gnome-shell/extensions`; their download URLs, archive
 SHA-256 hashes, licenses and local patches are in
 [desktop-motion-vendor.json](desktop-motion-vendor.json).
@@ -25,7 +25,7 @@ The local renderer patch clears depth before drawing the flat spring mesh.
 This prevents the window content from disappearing in virtual/offscreen
 rendering targets, as reproduced in the accelerated QEMU VM.
 
-Both motion extensions honor GNOME's animation setting. The Compiz patch also
+Both motion extensions honor GNOME's animation and reduced-motion settings. The Compiz patch also
 clears an active deformation when animations are disabled or the session locks.
 The settings are defaults, so users can override them.
 
@@ -103,7 +103,7 @@ distribution PAM stack.
 ## Updating the packages
 
 1. Download the exact archives recorded in the vendor manifest and verify their
-   SHA-256 hashes before extraction. For a version update, check GNOME 50 support
+   SHA-256 hashes before extraction. For a version update, check GNOME 51 support
    in the package metadata and update the manifest deliberately.
 2. Replace each complete extension directory, retaining its license and assets.
    Restore the local Dash to Dock CSS block and the documented Compiz patches.
@@ -119,7 +119,7 @@ distribution PAM stack.
    python3 -m unittest discover -s scripts/tests -p test_dash_to_dock_imports.py -v
    ```
 
-5. In a GNOME 50 VM, test hover transitions, app launch, drag and release,
+5. In a GNOME 51 VM, test hover transitions, app launch, drag and release,
    maximize/unmaximize, overview, closing a dragged window, extension disable
    and animation disable. Back up the guest extension folders, schema files and
    user dconf before activation. Restore those files and dconf if the desktop

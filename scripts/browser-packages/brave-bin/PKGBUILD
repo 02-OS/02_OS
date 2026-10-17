@@ -1,0 +1,59 @@
+# Wrap the verified vendor DEB payload; never execute Debian maintainer scripts.
+pkgname=brave-bin
+pkgver=0
+pkgrel=1
+pkgdesc='Brave stable (verified official binary)'
+arch=('x86_64')
+url='https://brave.com/'
+license=('MPL-2.0')
+depends=('alsa-lib' 'at-spi2-core' 'cairo' 'dbus' 'expat' 'gcc-libs' 'glib2'
+         'glibc' 'gtk3' 'libcups' 'libdrm' 'libx11' 'libxcb' 'libxcomposite'
+         'libxdamage' 'libxext' 'libxfixes' 'libxkbcommon' 'libxrandr'
+         'libxshmfence' 'mesa' 'nspr' 'nss' 'pango' 'systemd-libs'
+         'vulkan-icd-loader' 'xdg-utils')
+optdepends=('libpipewire: screen sharing on Wayland')
+provides=('brave' 'brave-browser')
+conflicts=('brave' 'brave-browser')
+options=('!strip' '!debug')
+source=('browser.deb')
+noextract=('browser.deb')
+sha256sums=('REPLACED_BY_VERIFIED_MANIFEST')
+
+prepare() {
+  mkdir -p vendor
+  bsdtar -xf browser.deb --include 'data.tar.*' -C vendor
+  local payload
+  payload=(vendor/data.tar.*)
+  [[ ${#payload[@]} == 1 && -f ${payload[0]} ]]
+  mkdir -p payload
+  bsdtar -xf "${payload[0]}" -C payload
+}
+
+package() {
+  local vendor="${srcdir}/payload"
+  [[ -x ${vendor}/opt/brave.com/brave/brave-browser ]]
+  [[ -f ${vendor}/usr/share/applications/brave-browser.desktop ]]
+  install -dm755 "${pkgdir}/opt/brave.com" "${pkgdir}/usr/bin" \
+    "${pkgdir}/usr/share/applications" "${pkgdir}/usr/share/icons"
+  cp -a "${vendor}/opt/brave.com/brave" "${pkgdir}/opt/brave.com/"
+  install -m644 "${vendor}/usr/share/applications/brave-browser.desktop" \
+    "${pkgdir}/usr/share/applications/"
+  if [[ -d ${vendor}/usr/share/icons/hicolor ]]; then
+    cp -a "${vendor}/usr/share/icons/hicolor" "${pkgdir}/usr/share/icons/"
+  fi
+  local logo size icon_count=0
+  for logo in "${vendor}/opt/brave.com/brave"/product_logo_*.png; do
+    [[ -f ${logo} ]] || continue
+    size="${logo##*/product_logo_}"
+    size="${size%.png}"
+    [[ ${size} =~ ^[0-9]+$ ]] || continue
+    install -Dm644 "${logo}" "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/brave-browser.png"
+    icon_count=$((icon_count + 1))
+  done
+  [[ ${icon_count} -gt 0 || -d ${vendor}/usr/share/icons/hicolor ]]
+  for launcher in brave brave-browser brave-browser-stable; do
+    ln -s /opt/brave.com/brave/brave-browser "${pkgdir}/usr/bin/${launcher}"
+  done
+  [[ -f ${pkgdir}/opt/brave.com/brave/chrome-sandbox ]]
+  chmod 4755 "${pkgdir}/opt/brave.com/brave/chrome-sandbox"
+}

@@ -112,6 +112,13 @@ Generate or automatically install MCP configurations for supported coding agents
 02 connect zed --write
 ```
 
+Written configurations use the absolute path of the running `02` executable,
+so a graphical client can start the server without inheriting the shell's PATH.
+Printed snippets keep the portable `02` command. OpenCode and Zed use
+`XDG_CONFIG_HOME` when it is an absolute path, falling back to `~/.config`.
+New configuration files are written atomically with mode `0600`; updates
+preserve an existing regular file's permissions and unrelated settings.
+
 Codex writes `~/.codex/config.toml` under `[mcp_servers.02]` (`command` and `args`). Claude Code writes user scope `~/.claude.json`, or a project `.mcp.json`, under `mcpServers` — not Claude Desktop's `~/.config/Claude/claude_desktop_config.json`. OpenCode writes `~/.config/opencode/opencode.json` with an `mcp` object (`type` `local`, `command` as an array). Cursor writes `~/.cursor/mcp.json`. Gemini CLI writes `~/.gemini/settings.json` under `mcpServers`, not `~/.gemini/antigravity-cli/mcp_config.json`. Claude Code, Cursor, and Gemini CLI use this shape:
 
 ```json
@@ -170,3 +177,19 @@ Zed is written into `~/.config/zed/settings.json` under `context_servers` (`sour
 - Socket permissions: `0600` (restricted to current user)
 - Automatically restarts on failure (`Restart=on-failure`, `RestartSec=3s`)
 - Watches registered repositories and keeps indices fresh in the background
+
+`02 init` and `02 index` automatically register the canonical repository path.
+Registration is saved even while the daemon is stopped. Use `02 unwatch` to
+opt out persistently, and `02 watch` to re-enable it. Later init/index commands
+respect that opt-out. `02 status --json` and `02 doctor --json` include `watching`
+and `daemon_available`; a corrupt watch registry is reported as an error.
+
+Index freshness compares HEAD, eligible file paths/content hashes, and the
+effective indexing configuration with the last completed index. Untracked
+changes, deletes, and selection changes invalidate it. Initialization alone
+does not certify an index; failed or interrupted runs remain stale until retry.
+
+Directory exclusions such as `build/` match directory components at any depth.
+Multi-component exclusions such as `src/generated/` select that root-relative
+subtree. A directory exclusion does not exclude similarly named files such as
+`build.rs` or directories such as `src/generated-other/`.

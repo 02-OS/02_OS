@@ -50,8 +50,12 @@ Coding Agents (Codex / Claude / OpenCode)
 # Inspect repository status, git HEAD, and indexed symbols
 02 status
 
-# Incremental re-index of working tree changes (<100ms)
+# Incremental re-index and automatic background watch registration
 02 index
+
+# Disable background indexing until explicitly re-enabled
+02 unwatch
+02 watch
 
 # Compile a task-focused evidence package within an 8,000 token budget
 02 context "fix refresh-token rotation race" --budget 8000
@@ -83,7 +87,7 @@ For complete documentation:
 
 | Piece | What you get |
 | :--- | :--- |
-| **Desktop Environment** | GNOME Shell 50 + Pop Shell (optional tiling toggle with `Super+Y`) |
+| **Desktop Environment** | GNOME Shell 51 + Pop Shell (optional tiling toggle with `Super+Y`) |
 | **Dock** | Dash to Dock + Flourish — Centered dock with smooth hover magnification and a single app launch bounce |
 | **Window motion** | Gentle jelly effect while dragging windows; honors GNOME's animation setting |
 | **Theme** | adw-gtk3-dark, Capitaine cursors, Inter 11 |
@@ -102,6 +106,18 @@ For disposable installed-OS VM tests, use the shared credentials documented in
 [VM testing](docs/VM_TESTING.md).
 
 See [Desktop motion](docs/desktop-motion.md) for settings, package versions and maintenance instructions.
+Chrome is pinned to the bottom dock. Brave is available in Show Applications
+alongside the other apps; open that grid with the nine-dot button or **Super+A**.
+Both browsers are native, preinstalled applications with matching 02-OS icons.
+Each image build resolves the latest stable vendor packages, verifies their
+signed repository metadata and downloads, and records the exact versions in
+`/usr/local/share/02os/browser-repo/manifest.json`. The installer uses those same
+packages for the installed desktop. Browser updates enter through a new image
+build; the build-time manifest records a snapshot rather than promising that an
+old image remains current. See [browser packaging](scripts/browser-packages/README.md).
+Image customization only verifies the browsers already installed by pacstrap.
+The installer stages browser archives only when the target needs them and
+removes that staged payload after success, retaining the version manifest.
 These effects ship in new builds from this source. The previously tested
 `2026.10.01` ISO predates them; pushing source changes does not update an existing ISO.
 
@@ -184,6 +200,17 @@ These effects ship in new builds from this source. The previously tested
 
 `./build.sh` is the only supported way to build a 02_OS image. It compiles the agent runtime, checks that the staged `02` and `02-agentd` binaries match that build, and then runs the image build in Docker. The agent binaries are not in git. A manual `mkarchiso` of this profile is not a 02_OS image: the image build refuses agent binaries that were not just stamped by `./build.sh`.
 
+Builds sharing a checkout or work directory are serialized. Each build copies the prepared profile
+into its owned work directory, excludes host Python bytecode, and mounts that
+copy read-only for mkarchiso. The copy and mkarchiso work tree remain available
+there for diagnosis until the next build reclaims the marked work directory.
+The image contains a source snapshot manifest. Its completion sidecar records
+that source identity, the resolved package inventory, and the ISO SHA-256/size.
+Development builds may include uncommitted source; releases require a clean
+checkout and an artifact built from the matching clean source snapshot.
+GNOME Shell/Mutter major 51 and Archinstall 4.5 are checked during image
+customization. Unsupported combinations fail the build or installer preflight.
+
 ```bash
 ./build.sh
 ```
@@ -214,6 +241,9 @@ Accelerated rendering in QEMU:
 From the live desktop, launch **Install 02_OS**. That starts `archinstall` with the 02_OS plugin. Choose the GNOME desktop profile. The plugin copies the 02 desktop profile, agent binaries, user daemon, and branding onto the new system after the base install and again after the desktop packages are installed.
 
 The installer guides you through partitioning, username creation, and bootloader configuration.
+The installed desktop omits the live-only installer shortcut. Live boot does
+not wait for Ethernet carrier or an automatic mirror refresh; NetworkManager
+and systemd-resolved handle networking once a connection is available.
 
 ---
 

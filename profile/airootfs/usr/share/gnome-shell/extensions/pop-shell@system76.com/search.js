@@ -175,7 +175,7 @@ export class Search {
         });
         this.list = new St.BoxLayout({
             styleClass: 'pop-shell-search-list',
-            vertical: true,
+            orientation: Clutter.Orientation.VERTICAL,
         });
         const scroller = new St.ScrollView();
         scroller.add_child(this.list);
@@ -342,7 +342,7 @@ export class SearchOption {
         attach_icon(layout, icon, icon_size);
         const info_box = new St.BoxLayout({
             y_align: Clutter.ActorAlign.CENTER,
-            vertical: true,
+            orientation: Clutter.Orientation.VERTICAL,
             x_expand: true,
         });
         info_box.add_child(label);

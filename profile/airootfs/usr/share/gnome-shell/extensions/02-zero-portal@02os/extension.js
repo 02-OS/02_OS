@@ -19,10 +19,19 @@ const INPUT_EVENTS = new Set([
 ]);
 
 export default class ZeroPortalExtension extends Extension {
+    _motionAllowed() {
+        const settings = St.Settings.get();
+        const reduced = settings.reduced_motion ?? settings.reducedMotion;
+        return this._interfaceSettings.get_boolean('enable-animations') &&
+            (!St.ReducedMotion || reduced !== St.ReducedMotion.REDUCE);
+    }
+
     enable() {
         this._areas = [];
         this._connections = [];
-        this._tickId = 0;
+        this._timeline = null;
+        this._newFrameId = 0;
+        this._completedId = 0;
         this._deadlineId = 0;
         this._errorIdleId = 0;
         this._startedAt = 0;
@@ -30,6 +39,7 @@ export default class ZeroPortalExtension extends Extension {
         this._interfaceSettings = null;
         this._diagnosticEvents = [];
         this._diagnosticWriteWarned = false;
+        this._finishing = false;
 
         if (Main.sessionMode.currentMode !== 'gdm')
             return;
@@ -62,7 +72,7 @@ export default class ZeroPortalExtension extends Extension {
         // St.Settings also automatically inhibits animations on software
         // renderers. This bounded Cairo effect honours the user's reduced
         // motion preference directly and can run in a software-rendered VM.
-        if (!this._interfaceSettings.get_boolean('enable-animations')) {
+        if (!this._motionAllowed()) {
             console.info('02 Zero Portal: skipped (reduced motion).');
             this._record('skipped', 'reduced motion');
             return;
@@ -79,9 +89,14 @@ export default class ZeroPortalExtension extends Extension {
                     this._finish('session changed');
             });
             this._connect(this._interfaceSettings, 'changed::enable-animations', () => {
-                if (!this._interfaceSettings.get_boolean('enable-animations'))
+                if (!this._motionAllowed())
                     this._finish('reduced motion');
             });
+            if (St.ReducedMotion)
+                this._connect(St.Settings.get(), 'notify::reduced-motion', () => {
+                    if (!this._motionAllowed())
+                        this._finish('reduced motion');
+                });
             // Resizing or unplugging a screen immediately reveals login rather
             // than leaving a partial full-screen mask on another monitor.
             this._connect(Main.layoutManager, 'monitors-changed', () => this._finish('monitor changed'));
@@ -171,16 +186,18 @@ export default class ZeroPortalExtension extends Extension {
         this._startedAt = GLib.get_monotonic_time();
         console.info('02 Zero Portal: begin (real login ready).');
         this._record('begin', 'real login ready');
-        this._tickId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 34, () => {
+        // The stage frame clock paces the paint. A fixed timeout drifts off
+        // the refresh and makes the same curve look stepped.
+        this._timeline = new Clutter.Timeline({
+            actor: this._areas[0],
+            duration: Math.round(DURATION_SECONDS * 1000),
+            progress_mode: Clutter.AnimationMode.LINEAR,
+        });
+        this._newFrameId = this._timeline.connect('new-frame', () => {
             try {
                 const elapsed = this._elapsed();
-                if (elapsed >= DURATION_SECONDS) {
-                    this._tickId = 0;
-                    this._finish('complete');
-                    return GLib.SOURCE_REMOVE;
-                }
                 const phase = elapsed < 0.15 ? 'logo' : elapsed < 0.95 ? '2 behind 0' :
-                    elapsed < 1.45 ? '0 expands' : elapsed < 1.6 ? 'portal opens' :
+                    elapsed < 1.1 ? '0 expands' : elapsed < 2.0 ? 'portal opens' :
                         'portal reveals real login';
                 if (phase !== this._phase) {
                     this._phase = phase;
@@ -189,18 +206,19 @@ export default class ZeroPortalExtension extends Extension {
                 }
                 for (const area of this._areas)
                     area.queue_repaint();
-                return GLib.SOURCE_CONTINUE;
             } catch (error) {
                 console.warn(`02 Zero Portal stopped: ${error.message}`);
                 this._record('error', error.message);
-                this._tickId = 0;
                 this._finish('error');
-                return GLib.SOURCE_REMOVE;
             }
         });
+        this._completedId = this._timeline.connect('completed', () => this._finish('complete'));
+        this._timeline.start();
     }
 
     _elapsed() {
+        if (this._timeline)
+            return this._timeline.get_elapsed_time() / 1000;
         return this._startedAt ?
             (GLib.get_monotonic_time() - this._startedAt) / 1_000_000 : 0;
     }
@@ -229,11 +247,25 @@ export default class ZeroPortalExtension extends Extension {
     }
 
     _finish(reason) {
+        if (this._finishing)
+            return;
+        this._finishing = true;
         if (this._areas?.length) {
             console.info(`02 Zero Portal: ${reason}; overlay removed at ${this._elapsed().toFixed(3)}s.`);
             this._record('removed', reason);
         }
-        for (const key of ['_tickId', '_deadlineId', '_errorIdleId']) {
+        const timeline = this._timeline;
+        this._timeline = null;
+        if (timeline) {
+            timeline.stop();
+            if (this._newFrameId)
+                timeline.disconnect(this._newFrameId);
+            if (this._completedId)
+                timeline.disconnect(this._completedId);
+        }
+        this._newFrameId = 0;
+        this._completedId = 0;
+        for (const key of ['_deadlineId', '_errorIdleId']) {
             if (this[key]) {
                 GLib.source_remove(this[key]);
                 this[key] = 0;

@@ -5,7 +5,8 @@
   "settings-schema": "org.gnome.shell.extensions.com.github.hermes83.compiz-windows-effect",
   "shell-version": [
     "49",
-    "50"
+    "50",
+    "51"
   ],
   "url": "https://github.com/hermes83/compiz-windows-effect",
   "uuid": "compiz-windows-effect@hermes83.github.com",

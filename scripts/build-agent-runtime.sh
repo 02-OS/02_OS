@@ -42,10 +42,10 @@ echo "Cargo target directory: ${TARGET_DIR}"
 
 # Build release binaries. Do not override CARGO_TARGET_DIR here; metadata and
 # these invocations share the caller's cargo configuration.
-cargo build --release --manifest-path "${AGENT_DIR}/Cargo.toml"
+cargo build --locked --release --manifest-path "${AGENT_DIR}/Cargo.toml"
 
 echo "=== [02 Agent Runtime] Running Verification Tests ==="
-cargo test --manifest-path "${AGENT_DIR}/Cargo.toml"
+cargo test --locked --manifest-path "${AGENT_DIR}/Cargo.toml"
 
 echo "=== [02 Agent Runtime] Staging Binaries into airootfs ==="
 mkdir -p "${DEST_DIR}"

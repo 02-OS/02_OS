@@ -70,11 +70,13 @@ mesa
 pipewire
 pipewire-alsa
 pipewire-pulse
+rtkit
 alsa-utils
 playerctl
 sof-firmware
 vulkan-intel
 vulkan-radeon
+vulkan-swrast
 wireplumber
 
 # Desktop UI & Utilities
@@ -105,10 +107,12 @@ ttf-jetbrains-mono-nerd
 ttf-nerd-fonts-symbols
 
 # Apps
+brave-bin
 blueman
 fastfetch
 firefox
 git
+google-chrome
 python
 sqlite
 

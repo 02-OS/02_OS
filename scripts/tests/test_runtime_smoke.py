@@ -160,7 +160,8 @@ class RuntimeSmokeTests(unittest.TestCase):
                     client.sendall((json.dumps(value) + "\n").encode())
                     return json.loads(reader.readline())
                 watched = request({"jsonrpc": "2.0", "id": 1, "method": "daemon/watch", "params": {"path": str(self.repo)}})
-                self.assertTrue(watched["result"]["added"])
+                # Initialization already registered this repository; explicit watch is idempotent.
+                self.assertFalse(watched["result"]["added"])
                 response = request({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "find_symbol", "arguments": {"name": "smoke_entry"}}})
                 self.assertFalse(response["result"]["isError"])
                 self.assertIn("smoke_entry", response["result"]["content"][0]["text"])

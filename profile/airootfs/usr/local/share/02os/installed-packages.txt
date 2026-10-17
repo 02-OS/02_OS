@@ -1,8 +1,15 @@
 # Installed by 02os-install for a GNOME system, before final provisioning.
 # Archinstall's GNOME profile is only gnome and gnome-tweaks. These are the
-# themes, cursors, font, browser, and icon fallback the 02 desktop defaults use.
+# themes, cursors, font, icon fallback and tools the 02 desktop defaults use.
+# Native Chrome and Brave packages are installed by 02os-install-browsers.
 adw-gtk-theme
 capitaine-cursors
-firefox
+git
 inter-font
 papirus-icon-theme
+power-profiles-daemon
+rtkit
+vulkan-swrast
+wl-clipboard
+xorg-xprop
+zram-generator

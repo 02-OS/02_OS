@@ -41,6 +41,13 @@ install_02os_identity() {
 }
 
 /usr/local/bin/02os-check-runtime
+/usr/local/bin/02os-check-desktop
+/usr/local/bin/02os-check-desktop --installer
+
+echo "==> Verifying preinstalled Chrome and Brave..."
+# mkarchiso has already installed packages.x86_64 with pacstrap. Do not start a
+# second transaction in this chroot, which has no copied build-host keyring.
+/usr/local/bin/02os-install-browsers --verify-only
 
 echo "==> Installing the 02_OS identity..."
 install_02os_identity /

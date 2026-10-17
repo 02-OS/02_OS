@@ -4,8 +4,8 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: 02os-provision TARGET" >&2
-  echo "       02os-provision --source DIR --target DIR" >&2
+  echo "Usage: 02os-provision [--browser-payload] TARGET" >&2
+  echo "       02os-provision [--browser-payload] --source DIR --target DIR" >&2
   exit 2
 }
 
@@ -15,6 +15,7 @@ if [[ -z "${source_root}" ]]; then
   source_root=/
 fi
 target=""
+browser_payload=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -27,6 +28,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || usage
       target="$2"
       shift 2
+      ;;
+    --browser-payload)
+      browser_payload=true
+      shift
       ;;
     --help|-h)
       usage
@@ -64,6 +69,10 @@ if ! target_canon="$(readlink -f -- "${target}")"; then
   echo "ERROR: target parent must already exist: ${target}" >&2
   exit 1
 fi
+if [[ "${target_canon}" == "/" || "${target_canon}" == "${source_canon}" ]]; then
+  echo "ERROR: target must be separate from the running live system and source overlay." >&2
+  exit 1
+fi
 
 # True when path is source_canon or a path under it. `/` contains every absolute path.
 is_inside_root() {
@@ -94,14 +103,48 @@ assert_inside() {
   fi
 }
 
+assert_target_inside() {
+  local path="$1" resolved=""
+  resolved="$(readlink -m -- "${path}")"
+  if ! is_inside_root "${target_canon}" "${resolved}"; then
+    echo "ERROR: refusing to modify ${path} (resolves outside the installed target)" >&2
+    return 1
+  fi
+}
+
+# Browser validation deliberately rejects symlinks, including redirects within
+# the target. Reject them before copying so an eventual helper failure cannot
+# overwrite another target directory through a redirected repository path.
+assert_browser_target_path() {
+  local path="$1" current="${target_canon}" part
+  local -a parts=()
+  assert_target_inside "${path}"
+  IFS=/ read -r -a parts <<< "${path#"${target_canon}/"}"
+  for part in "${parts[@]}"; do
+    current="${current}/${part}"
+    if [[ -L "${current}" ]]; then
+      echo "ERROR: refusing browser destination symlink: ${current}" >&2
+      return 1
+    fi
+  done
+}
+
 # Missing required entries abort the install. Optional entries are skipped.
 required=(
+  usr/local/bin/02os-check-desktop
+  usr/local/share/02os/desktop-compatibility.json
+  etc/sysctl.d/99-02os-performance.conf
+  etc/systemd/zram-generator.conf
   usr/bin/02
   usr/bin/02-agentd
   usr/bin/02agent
+  usr/lib/02-agent/prepare-storage.sh
+  usr/lib/systemd/user-generators/02-agent-storage
   usr/lib/systemd/user/02-agentd.service
   etc/systemd/user/default.target.wants/02-agentd.service
   usr/local/bin/pop-launcher
+  usr/local/bin/02os-install-browsers
+  usr/local/share/02os/browser-repo/manifest.json
   usr/share/gnome-shell/extensions/dash-to-dock@micxgx.gmail.com
   usr/share/gnome-shell/extensions/pop-shell@system76.com
   usr/share/gnome-shell/extensions/flourish@orsso.github.io
@@ -129,9 +172,7 @@ required=(
 
 optional=(
   usr/local/bin/pop-shell-shortcuts
-  usr/local/bin/02os-install
   usr/local/bin/02os-provision
-  usr/share/applications/02os-install.desktop
   usr/lib/02-agent
 )
 
@@ -139,18 +180,33 @@ copy_entry() {
   local rel="$1"
   local src="${source_canon}/${rel}"
   local dest="${target_canon}/${rel}"
-  local link=""
+  local link="" entry=""
   if [[ ! -e "${src}" && ! -L "${src}" ]]; then
     echo "WARNING: skipping missing ${rel}" >&2
     return 0
   fi
   assert_inside "${src}"
+  assert_target_inside "${dest}"
+  case "${rel}" in
+    usr/local/bin/02os-install-browsers|usr/local/share/02os/browser-repo|usr/local/share/02os/browser-repo/*)
+      assert_browser_target_path "${dest}"
+      ;;
+  esac
   if [[ -d "${src}" && ! -L "${src}" ]]; then
     while IFS= read -r -d '' link; do
       assert_inside "${link}"
     done < <(find "${src}" -type l -print0)
     mkdir -p -- "${dest}"
-    cp -a -- "${src}/." "${dest}/"
+    if [[ "${rel}" == "usr/local/share/02os/browser-repo" ]]; then
+      # This marker authorizes replacement of the generated live source repo;
+      # it has no meaning in an installed target and must stay on the source.
+      while IFS= read -r -d '' entry; do
+        [[ "${entry##*/}" == ".02os-generated-browser-repo" ]] && continue
+        copy_entry "${rel}/${entry##*/}"
+      done < <(find "${src}" -mindepth 1 -maxdepth 1 -print0)
+    else
+      cp -a -- "${src}/." "${dest}/"
+    fi
   else
     mkdir -p -- "$(dirname -- "${dest}")"
     if [[ "${rel}" == "etc/os-release" ]]; then
@@ -256,9 +312,35 @@ PY
 mkdir -p -- "${target_canon}"
 echo "02os-provision: ${source_canon} -> ${target_canon}"
 
+# The final installer hook stages these large archives only if its installed
+# version check fails. Early and repeated shared provisioning copy the small
+# manifest, never the archive payload. Failed installs retain it for diagnosis.
+if "${browser_payload}"; then
+  require_entry usr/local/bin/02os-install-browsers
+  require_entry usr/local/share/02os/browser-repo
+  require_entry usr/local/share/02os/browser-repo/manifest.json
+  # A reused target must not redirect any archive write outside its root.
+  payload_dest="${target_canon}/usr/local/share/02os/browser-repo"
+  assert_browser_target_path "${target_canon}/usr/local/bin/02os-install-browsers"
+  assert_browser_target_path "${payload_dest}"
+  if [[ -d "${payload_dest}" ]]; then
+    while IFS= read -r -d '' link; do
+      assert_browser_target_path "${link}"
+    done < <(find "${payload_dest}" -type l -print0)
+  fi
+  copy_entry usr/local/bin/02os-install-browsers
+  copy_entry usr/local/share/02os/browser-repo
+  exit 0
+fi
+
 for rel in "${required[@]}"; do
   require_entry "${rel}"
 done
+
+# Validate browser destinations before any shared /usr/local/share/02os file
+# can be copied through a redirected parent.
+assert_browser_target_path "${target_canon}/usr/local/bin/02os-install-browsers"
+assert_browser_target_path "${target_canon}/usr/local/share/02os/browser-repo/manifest.json"
 
 for rel in "${required[@]}" "${optional[@]}"; do
   if launcher_needs_missing_plugin "${rel}"; then
@@ -266,6 +348,18 @@ for rel in "${required[@]}" "${optional[@]}"; do
     continue
   fi
   copy_entry "${rel}"
+done
+
+# Remove these exact project-owned live launchers from targets provisioned by
+# older images, while preserving unrelated applications and the source image.
+for rel in usr/local/bin/02os-install usr/share/applications/02os-install.desktop; do
+  dest="${target_canon}/${rel}"
+  assert_target_inside "${dest}"
+  if [[ -d "${dest}" ]]; then
+    echo "ERROR: refusing to remove live installer path that is a directory: ${dest}" >&2
+    exit 1
+  fi
+  rm -f -- "${dest}"
 done
 
 strip_installer_favorite

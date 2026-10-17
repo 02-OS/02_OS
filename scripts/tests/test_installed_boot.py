@@ -1,7 +1,12 @@
 """Installed Plymouth configuration without installing packages or an OS."""
 import importlib.util
 from enum import Enum
+import hashlib
+import json
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 import tempfile
 from types import MethodType, ModuleType, SimpleNamespace
 import unittest
@@ -16,7 +21,12 @@ class InstalledBootTests(unittest.TestCase):
     def setUp(self):
         spec = importlib.util.spec_from_file_location("02os_archinstall_test", PLUGIN_PATH)
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        previous = sys.dont_write_bytecode
+        try:
+            sys.dont_write_bytecode = True
+            spec.loader.exec_module(module)
+        finally:
+            sys.dont_write_bytecode = previous
         module.INSTALLED_PACKAGES = ROOT / "profile/airootfs/usr/local/share/02os/installed-packages.txt"
         self.module = module
         self.plugin = module.Plugin()
@@ -54,8 +64,10 @@ class InstalledBootTests(unittest.TestCase):
         target = self.installation(["base", "udev", "kms", "filesystems"], ["root=UUID=target"])
         events = []
         self.plugin._provision = Mock(side_effect=lambda _target: events.append("copy-theme"))
+        self.plugin._install_browsers = Mock(side_effect=lambda _target: events.append("install-browsers"))
         target.add_additional_packages.side_effect = lambda _packages: events.append("install-package")
-        target.arch_chroot.side_effect = lambda _command: events.append("select-theme")
+        target.arch_chroot.side_effect = lambda command: events.append(
+            "check-desktop" if command.endswith("02os-check-desktop") else "select-theme")
 
         def generate(flags):
             self.assertEqual(flags, ["-P"])
@@ -67,11 +79,135 @@ class InstalledBootTests(unittest.TestCase):
         target.mkinitcpio.side_effect = generate
         self.plugin.on_install(target)
         # archinstall generates the bootloader after on_install returns.
-        self.assertEqual(events, ["copy-theme", "install-package", "select-theme", "regenerate-image"])
+        self.assertEqual(events, ["install-package", "copy-theme", "select-theme", "regenerate-image"])
         target.add_additional_packages.assert_called_once_with(["plymouth"])
         self.plugin.on_genfstab(target)
-        self.assertEqual(events[-3:], ["copy-theme", "select-theme", "regenerate-image"])
+        self.assertEqual(events[-6:], ["install-package", "copy-theme", "check-desktop", "install-browsers", "select-theme", "regenerate-image"])
+        desktop = self.module._read_installed_packages(self.module.INSTALLED_PACKAGES)
+        self.assertEqual(target.add_additional_packages.call_args.args, (desktop,))
         self.assertEqual(target.arch_chroot.call_args.args, ("plymouth-set-default-theme 02-zero-portal",))
+
+    def test_plymouth_package_failure_precedes_provisioned_configuration(self):
+        target = self.installation(["base", "udev", "kms", "filesystems"])
+        self.plugin._provision = Mock()
+        target.add_additional_packages.side_effect = RuntimeError("Plymouth installation failed")
+        with self.assertRaisesRegex(RuntimeError, "Plymouth installation failed"):
+            self.plugin.on_install(target)
+        self.plugin._provision.assert_not_called()
+        self.assertNotIn("plymouth", target._hooks)
+
+    def test_browser_install_failure_aborts_final_installed_configuration(self):
+        target = self.installation(["base", "udev", "kms", "filesystems"])
+        self.plugin._provision = Mock()
+        self.plugin._activate_theme = Mock()
+        self.plugin._install_browsers = Mock(side_effect=RuntimeError("Browser package installation failed"))
+        with self.assertRaisesRegex(RuntimeError, "Browser package"):
+            self.plugin.on_genfstab(target)
+        self.plugin._install_browsers.assert_called_once_with(target)
+        self.plugin._activate_theme.assert_not_called()
+
+    def browser_fixture(self):
+        temporary = tempfile.TemporaryDirectory(prefix="02os-installed-browser-")
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        source = root / "live-repo"
+        source.mkdir()
+        target = self.installation(["base", "udev", "kms", "filesystems"])
+        target.target = root / "target"
+        repo = target.target / "usr/local/share/02os/browser-repo"
+        repo.mkdir(parents=True)
+        packages = []
+        for name in ("google-chrome", "brave-bin"):
+            filename = f"{name}-1-1-x86_64.pkg.tar.zst"
+            payload = name.encode()
+            (source / filename).write_bytes(payload)
+            packages.append({"name": name, "version": "1-1", "filename": filename,
+                             "sha256": hashlib.sha256(payload).hexdigest()})
+        database = b"image browser database"
+        for name in ("02os-browsers.db", "02os-browsers.db.tar.gz"):
+            (source / name).write_bytes(database)
+        digest = hashlib.sha256(database).hexdigest()
+        manifest = {"format_version": 1, "architecture": "x86_64", "packages": packages,
+                    "repository": {"name": "02os-browsers", "filename": "02os-browsers.db.tar.gz",
+                                   "database_filename": "02os-browsers.db", "sha256": digest,
+                                   "database_sha256": digest}}
+        (source / "manifest.json").write_text(json.dumps(manifest))
+        shutil.copyfile(source / "manifest.json", repo / "manifest.json")
+        return target, source, repo
+
+    def test_final_browser_stage_is_once_and_cleanup_preserves_manifest_source_and_user_files(self):
+        target, source, repo = self.browser_fixture()
+        cache = target.target / "var/cache/pacman/pkg/user-package.pkg.tar.zst"
+        cache.parent.mkdir(parents=True)
+        cache.write_bytes(b"unrelated cache")
+        note = repo / "diagnostic.txt"
+        note.write_text("preserve this")
+        installed = False
+
+        def query(command, **kwargs):
+            self.assertEqual(command, ["arch-chroot", "-S", str(target.target),
+                                       "/usr/local/bin/02os-install-browsers", "--verify-only"])
+            return subprocess.CompletedProcess(command, 0 if installed else 1)
+
+        def stage(command):
+            self.assertEqual(command, ["/usr/local/bin/02os-provision", "--browser-payload", str(target.target)])
+            for path in source.iterdir():
+                shutil.copyfile(path, repo / path.name)
+
+        def install(command):
+            nonlocal installed
+            self.assertEqual(command, "/usr/local/bin/02os-install-browsers")
+            installed = True
+
+        target.arch_chroot.side_effect = install
+        with patch("subprocess.run", side_effect=query) as queries, \
+                patch("subprocess.check_call", side_effect=stage) as stages:
+            self.plugin._install_browsers(target)
+            self.plugin._install_browsers(target)
+        self.assertEqual(queries.call_count, 2)
+        stages.assert_called_once()
+        target.arch_chroot.assert_called_once()
+        self.assertEqual(set(path.name for path in repo.iterdir()), {"manifest.json", "diagnostic.txt"})
+        self.assertEqual((repo / "manifest.json").read_bytes(), (source / "manifest.json").read_bytes())
+        self.assertEqual(len(list(source.iterdir())), 5)
+        self.assertEqual(cache.read_bytes(), b"unrelated cache")
+        self.assertEqual(note.read_text(), "preserve this")
+
+    def test_failed_browser_install_preserves_staged_payload_for_diagnosis(self):
+        target, source, repo = self.browser_fixture()
+
+        def stage(_command):
+            for path in source.iterdir():
+                shutil.copyfile(path, repo / path.name)
+
+        target.arch_chroot.side_effect = RuntimeError("browser transaction failed")
+        with patch("subprocess.run", return_value=subprocess.CompletedProcess([], 1)), \
+                patch("subprocess.check_call", side_effect=stage):
+            with self.assertRaisesRegex(RuntimeError, "transaction failed"):
+                self.plugin._install_browsers(target)
+        for path in source.iterdir():
+            self.assertEqual((repo / path.name).read_bytes(), path.read_bytes())
+
+    def test_cleanup_rejects_changed_payload_without_removing_other_files(self):
+        target, source, repo = self.browser_fixture()
+        for path in source.iterdir():
+            shutil.copyfile(path, repo / path.name)
+        (repo / "02os-browsers.db").write_bytes(b"changed by someone else")
+        with self.assertRaisesRegex(RuntimeError, "changed.*preserving"):
+            self.plugin._cleanup_browser_payload(target)
+        self.assertEqual(len(list(repo.iterdir())), 5)
+
+    def test_cleanup_rejects_payload_symlink_and_live_root(self):
+        target, source, repo = self.browser_fixture()
+        database = repo / "02os-browsers.db"
+        database.symlink_to(source / database.name)
+        with self.assertRaisesRegex(RuntimeError, "symlink"):
+            self.plugin._cleanup_browser_payload(target)
+        self.assertTrue(database.is_symlink())
+        self.assertTrue((source / database.name).is_file())
+        target.target = "/"
+        with self.assertRaisesRegex(RuntimeError, "live system"):
+            self.plugin._cleanup_browser_payload(target)
 
     def test_repositions_existing_plymouth_before_encryption(self):
         target = self.installation(["base", "udev", "kms", "encrypt", "plymouth", "filesystems"])
@@ -243,7 +379,12 @@ class FirmwareTitleTests(unittest.TestCase):
         fixture = ROOT / "scripts/tests/fixtures/archinstall_4_5_bootloader.py"
         spec = importlib.util.spec_from_file_location("archinstall45_recording", fixture)
         official = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(official)
+        previous = sys.dont_write_bytecode
+        try:
+            sys.dont_write_bytecode = True
+            spec.loader.exec_module(official)
+        finally:
+            sys.dont_write_bytecode = previous
 
         class Bootloader(Enum):
             Systemd = "systemd"

@@ -24,6 +24,7 @@ import * as add_exception from './dialog_add_exception.js';
 import * as exec from './executor.js';
 import * as dbus_service from './dbus_service.js';
 import * as scheduler from './scheduler.js';
+import * as Maximization from './maximization.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 const display = global.display;
 const wim = global.window_manager;
@@ -633,11 +634,11 @@ export class Ext extends Ecs.System {
                 prev.workspace_id() === win.workspace_id()) {
                 if (prev.rect().contains(win.rect())) {
                     if (prev.is_maximized()) {
-                        prev.meta.unmaximize(Meta.MaximizeFlags.BOTH);
+                        Maximization.unmaximize(prev.meta);
                     }
                 }
                 else if (prev.stack) {
-                    prev.meta.unmaximize(Meta.MaximizeFlags.BOTH);
+                    Maximization.unmaximize(prev.meta);
                     this.auto_tiler.forest.stacks.get(prev.stack)?.restack();
                 }
             }
@@ -739,7 +740,7 @@ export class Ext extends Ecs.System {
                     !this.contains_tag(compare.entity, Tags.Floating) &&
                     compare.is_maximized() &&
                     win.entity[0] !== compare.entity[0]) {
-                    compare.meta.unmaximize(Meta.MaximizeFlags.BOTH);
+                    Maximization.unmaximize(compare.meta);
                 }
             }
         }
@@ -946,16 +947,14 @@ export class Ext extends Ecs.System {
             }
             if (this.auto_tiler) {
                 if (this.is_floating(win)) {
-                    win.meta.unmaximize(Meta.MaximizeFlags.HORIZONTAL);
-                    win.meta.unmaximize(Meta.MaximizeFlags.VERTICAL);
-                    win.meta.unmaximize(Meta.MaximizeFlags.BOTH);
+                    Maximization.unmaximize(win.meta);
                 }
                 this.register(Events.window_move(this, win, rect));
             }
             else {
                 win.move(this, rect, () => { });
                 if (rect.width == next_area.width && rect.height == next_area.height) {
-                    win.meta.maximize(Meta.MaximizeFlags.BOTH);
+                    Maximization.maximize(win.meta);
                 }
             }
         }
@@ -1290,7 +1289,7 @@ export class Ext extends Ecs.System {
     }
     on_show_window_titles() {
         const show_title = this.settings.show_title();
-        if (indicator) {
+        if (indicator?.toggle_titles) {
             indicator.toggle_titles.setToggleState(show_title);
         }
         for (const window of this.windows.values()) {

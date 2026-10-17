@@ -1,3 +1,4 @@
+import {motionEnabled} from './motionPreference.js';
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
@@ -130,7 +131,7 @@ export class AttentionEngine {
             urgent: icon.urgent,
             focused: icon.focused,
             dnd: !this.#notifications.get_boolean('show-banners'),
-            animationsEnabled: St.Settings.get().enable_animations,
+            animationsEnabled: motionEnabled(),
             iconAtRest: controller.atRest,
             dockState: context.visibility.state,
             shownRectKnown: context.visibility.shownRect !== null,

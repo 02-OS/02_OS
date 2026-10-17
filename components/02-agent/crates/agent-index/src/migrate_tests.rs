@@ -33,6 +33,10 @@ fn v1_database_upgrades_in_place() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].relative_path, "src/main.rs");
     assert_eq!(files[0].language, agent_core::Language::Rust);
+    assert!(db
+        .completed_index(&agent_core::RepoId::new("repo"))
+        .unwrap()
+        .is_none());
 
     let marker: i64 = {
         let conn = Connection::open(&db_path).unwrap();

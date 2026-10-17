@@ -377,6 +377,10 @@ fn jsonrpc_notifications_are_silent_and_bad_version_is_invalid_request() {
 
 #[test]
 fn connect_write_preserves_client_files() {
+    let executable = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     let home = tempdir().unwrap();
     let root = home.path();
 
@@ -408,7 +412,10 @@ trust_level = \"trusted\"
         codex_doc["mcp_servers"]["other"]["args"].clone(),
         json!(["-y", "other"])
     );
-    assert_eq!(codex_doc["mcp_servers"]["02"]["command"], "02");
+    assert_eq!(
+        codex_doc["mcp_servers"]["02"]["command"],
+        executable.as_str()
+    );
     assert_eq!(
         codex_doc["mcp_servers"]["02"]["args"].clone(),
         json!(["mcp"])
@@ -451,7 +458,7 @@ trust_level = \"trusted\"
     assert_eq!(opencode_doc["mcp"]["02"]["type"], "local");
     assert_eq!(
         opencode_doc["mcp"]["02"]["command"].clone(),
-        json!(["02", "mcp"])
+        json!([executable, "mcp"])
     );
 
     let claude = root.join(".claude.json");
@@ -469,7 +476,10 @@ trust_level = \"trusted\"
         "keep"
     );
     assert_eq!(claude_doc["mcpServers"]["other"]["command"], "keep");
-    assert_eq!(claude_doc["mcpServers"]["02"]["command"], "02");
+    assert_eq!(
+        claude_doc["mcpServers"]["02"]["command"],
+        executable.as_str()
+    );
     assert_eq!(
         claude_doc["mcpServers"]["02"]["args"].clone(),
         json!(["mcp"])
@@ -545,7 +555,8 @@ KEEP_SETTING = "keep-me"
     fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
     let mut old_file = fs::File::open(&path).unwrap();
     let mut expected: toml::Table = toml::from_str(original).unwrap();
-    expected["mcp_servers"]["02"]["command"] = toml::Value::String("02".into());
+    expected["mcp_servers"]["02"]["command"] =
+        toml::Value::String(std::env::current_exe().unwrap().to_str().unwrap().into());
     expected["mcp_servers"]["02"]["args"] =
         toml::Value::Array(vec![toml::Value::String("mcp".into())]);
 

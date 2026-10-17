@@ -1,5 +1,5 @@
 use crate::scanner::ScannedFile;
-use crate::schema::{CURRENT_SCHEMA_VERSION, SCHEMA_V1_SQL, SCHEMA_V2_SQL};
+use crate::schema::{CURRENT_SCHEMA_VERSION, SCHEMA_V1_SQL, SCHEMA_V2_SQL, SCHEMA_V4_SQL};
 use crate::search::{FtsSearcher, SearchResult};
 use agent_core::{
     error::AgentError,
@@ -10,7 +10,7 @@ use agent_core::{
     Result,
 };
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -18,6 +18,26 @@ use std::path::{Path, PathBuf};
 
 pub struct IndexDatabase {
     pub(crate) conn: Connection,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompletedIndexState {
+    pub head_commit: Option<String>,
+    pub fingerprint: String,
+}
+
+/// Serializes multi-transaction indexing pipelines, including separate processes.
+pub struct IndexRunGuard(Option<fs::File>);
+
+impl Drop for IndexRunGuard {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        if let Some(file) = &self.0 {
+            unsafe {
+                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +135,8 @@ impl IndexDatabase {
                 })?;
         }
         crate::graph::migrate_unscoped_commit_nodes(&tx)?;
+        tx.execute_batch(SCHEMA_V4_SQL)
+            .map_err(|e| AgentError::Database(format!("Schema v4 initialization failed: {e}")))?;
 
         let version: Option<i32> = tx
             .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
@@ -152,6 +174,61 @@ impl IndexDatabase {
                 row.get(0)
             })
             .map_err(|e| AgentError::Database(format!("Schema version read failed: {}", e)))
+    }
+
+    pub fn lock_index(&self) -> Result<IndexRunGuard> {
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+        let Some(path) = self.conn.path().filter(|path| !path.is_empty()) else {
+            return Ok(IndexRunGuard(None));
+        };
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(format!("{path}.index.lock"))?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(IndexRunGuard(Some(file)))
+    }
+
+    pub fn invalidate_index(&self, repo_id: &RepoId) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM completed_index_state WHERE repo_id = ?1",
+                params![repo_id.as_str()],
+            )
+            .map_err(|e| AgentError::Database(format!("Invalidate index: {e}")))?;
+        Ok(())
+    }
+
+    pub fn completed_index(&self, repo_id: &RepoId) -> Result<Option<CompletedIndexState>> {
+        self.conn
+            .query_row(
+                "SELECT head_commit, fingerprint FROM completed_index_state WHERE repo_id = ?1",
+                params![repo_id.as_str()],
+                |row| {
+                    Ok(CompletedIndexState {
+                        head_commit: row.get(0)?,
+                        fingerprint: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| AgentError::Database(format!("Read index completion: {e}")))
+    }
+
+    pub fn complete_index(&mut self, info: &RepoInfo, fingerprint: &str) -> Result<()> {
+        self.update_repo_info(info)?;
+        self.conn.execute("INSERT INTO completed_index_state (repo_id, head_commit, fingerprint, completed_at)
+            VALUES (?1, ?2, ?3, ?4) ON CONFLICT(repo_id) DO UPDATE SET
+            head_commit=excluded.head_commit, fingerprint=excluded.fingerprint, completed_at=excluded.completed_at",
+            params![info.id.as_str(), info.head_commit, fingerprint, Utc::now().to_rfc3339()])
+            .map_err(|e| AgentError::Database(format!("Complete index: {e}")))?;
+        Ok(())
     }
 
     /// Record or update repository metadata.
@@ -302,7 +379,7 @@ impl IndexDatabase {
         let (head_commit, last_indexed_at): (Option<String>, Option<String>) = self
             .conn
             .query_row(
-                "SELECT head_commit, indexed_at FROM repositories WHERE repo_id = ?1",
+                "SELECT head_commit, completed_at FROM completed_index_state WHERE repo_id = ?1",
                 params![repo_id.as_str()],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )

@@ -1,0 +1,15 @@
+{
+  "gnome_major": "51",
+  "archinstall": "4.5",
+  "extensions": [
+    "dash-to-dock@micxgx.gmail.com",
+    "pop-shell@system76.com",
+    "flourish@orsso.github.io",
+    "compiz-windows-effect@hermes83.github.com",
+    "02-zero-portal@02os"
+  ],
+  "installer_api": {
+    "add_bootloader": ["bootloader", "uki_enabled", "bootloader_removable", "plymouth"],
+    "_add_efistub_bootloader": ["boot_partition", "root", "uki_enabled"]
+  }
+}

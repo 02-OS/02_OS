@@ -1,6 +1,6 @@
 use agent_core::{paths::StoragePaths, types::LiveEnvironmentInfo, Result};
 use agent_git::{GitDiscovery, GitRepo};
-use agent_index::IndexDatabase;
+use agent_index::{IndexDatabase, RepoScanner};
 use serde_json::json;
 use std::env;
 
@@ -12,6 +12,8 @@ pub fn execute(json_output: bool) -> Result<()> {
 
     let db_path = StoragePaths::repo_db_path(&repo_info.id)?;
     let live_env = LiveEnvironmentInfo::detect();
+    let watching = crate::commands::watch::watching(&repo_root)?;
+    let daemon_available = crate::commands::watch::daemon_available();
 
     if !db_path.exists() {
         if json_output {
@@ -21,6 +23,9 @@ pub fn execute(json_output: bool) -> Result<()> {
                 "name": repo_info.name,
                 "root_path": repo_info.root_path,
                 "initialized": false,
+                "watching": watching,
+                "daemon_available": daemon_available,
+                "is_index_fresh": false,
             });
             println!("{}", serde_json::to_string_pretty(&out)?);
         } else {
@@ -57,9 +62,17 @@ pub fn execute(json_output: bool) -> Result<()> {
         })
         .count();
 
-    let diff_files = git_repo.get_diff_files().unwrap_or_default();
-    let is_index_fresh =
-        stats.last_indexed_commit == repo_info.head_commit && diff_files.is_empty();
+    let diff_files = git_repo.get_diff_files()?;
+    let completed = db.completed_index(&repo_info.id)?;
+    let is_index_fresh = completed.is_some_and(|state| {
+        state.head_commit == repo_info.head_commit
+            && state.fingerprint
+                == RepoScanner::new(
+                    &repo_root,
+                    agent_core::RepoConfig::load_or_default(&repo_root),
+                )
+                .fingerprint()
+    });
 
     if json_output {
         let out = json!({
@@ -83,6 +96,8 @@ pub fn execute(json_output: bool) -> Result<()> {
             "last_indexed_commit": stats.last_indexed_commit,
             "last_indexed_at": stats.last_indexed_at,
             "is_index_fresh": is_index_fresh,
+            "watching": watching,
+            "daemon_available": daemon_available,
             "memories": {
                 "total": memories.len(),
                 "fresh": fresh_memories,
@@ -97,6 +112,15 @@ pub fn execute(json_output: bool) -> Result<()> {
         println!("  Repository:       {}", repo_info.name);
         println!("  Root Path:        {}", repo_info.root_path.display());
         println!("  Repo ID:          {}", repo_info.id);
+        println!(
+            "  Background Watch: {} (daemon {})",
+            if watching { "enabled" } else { "disabled" },
+            if daemon_available {
+                "available"
+            } else {
+                "stopped"
+            }
+        );
         println!(
             "  Branch:           {}",
             repo_info.branch.as_deref().unwrap_or("none")
@@ -141,7 +165,7 @@ pub fn execute(json_output: bool) -> Result<()> {
         println!(
             "  Index Freshness:  {}",
             if is_index_fresh {
-                "Fresh (synced with HEAD)".to_string()
+                "Fresh (matches the completed index snapshot)".to_string()
             } else {
                 "Stale (changes detected; run '02 index')".to_string()
             }

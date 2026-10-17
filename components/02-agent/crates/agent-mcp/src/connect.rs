@@ -32,20 +32,24 @@ impl AgentTarget {
     }
 
     pub fn config_path(&self, home: &Path) -> Option<PathBuf> {
+        self.config_path_in(home, &home.join(".config"))
+    }
+
+    fn config_path_in(&self, home: &Path, config_home: &Path) -> Option<PathBuf> {
         match self {
             Self::Codex => Some(home.join(".codex/config.toml")),
             Self::Claude => Some(home.join(".claude.json")),
-            Self::OpenCode => Some(home.join(".config/opencode/opencode.json")),
+            Self::OpenCode => Some(config_home.join("opencode/opencode.json")),
             Self::Cursor => Some(home.join(".cursor/mcp.json")),
             Self::Gemini => Some(home.join(".gemini/settings.json")),
-            Self::Zed => Some(home.join(".config/zed/settings.json")),
+            Self::Zed => Some(config_home.join("zed/settings.json")),
             Self::Generic => None,
         }
     }
 
     pub fn default_config_path(&self) -> Option<PathBuf> {
         let home = StoragePaths::home_dir().ok()?;
-        self.config_path(&home)
+        self.config_path_in(&home, &xdg_config_home(&home))
     }
 }
 
@@ -54,12 +58,16 @@ pub struct AgentConnector;
 impl AgentConnector {
     /// Logical MCP snippet. Codex is represented as JSON here; the file format is TOML.
     pub fn generate_config(target: &AgentTarget) -> Value {
+        Self::generate_config_for(target, "02")
+    }
+
+    fn generate_config_for(target: &AgentTarget, command: &str) -> Value {
         match target {
             AgentTarget::Zed => json!({
                 "context_servers": {
                     "02": {
                         "source": "custom",
-                        "command": "02",
+                        "command": command,
                         "args": ["mcp"],
                         "env": {}
                     }
@@ -69,14 +77,14 @@ impl AgentConnector {
                 "mcp": {
                     "02": {
                         "type": "local",
-                        "command": ["02", "mcp"]
+                        "command": [command, "mcp"]
                     }
                 }
             }),
             AgentTarget::Codex => json!({
                 "mcp_servers": {
                     "02": {
-                        "command": "02",
+                        "command": command,
                         "args": ["mcp"]
                     }
                 }
@@ -84,7 +92,7 @@ impl AgentConnector {
             _ => json!({
                 "mcpServers": {
                     "02": {
-                        "command": "02",
+                        "command": command,
                         "args": ["mcp"]
                     }
                 }
@@ -94,12 +102,16 @@ impl AgentConnector {
 
     /// Client-native text (TOML for Codex, JSON otherwise).
     pub fn render_config(target: &AgentTarget) -> Result<String> {
+        Self::render_config_for(target, "02")
+    }
+
+    fn render_config_for(target: &AgentTarget, command: &str) -> Result<String> {
         let text = if matches!(target, AgentTarget::Codex) {
             let mut doc = toml::Table::new();
-            upsert_codex(&mut doc)?;
+            upsert_codex(&mut doc, command)?;
             toml::to_string_pretty(&doc)?
         } else {
-            serde_json::to_string_pretty(&Self::generate_config(target))
+            serde_json::to_string_pretty(&Self::generate_config_for(target, command))
                 .map_err(|err| AgentError::General(format!("JSON serialization error: {err}")))?
         };
         require_valid_02(target, &text)?;
@@ -119,15 +131,37 @@ impl AgentConnector {
     /// Connect and write or print the MCP configuration for a coding agent.
     pub fn connect(target_name: &str, write_to_file: bool) -> Result<String> {
         let home = StoragePaths::home_dir()?;
-        Self::connect_at(&home, target_name, write_to_file)
+        Self::connect_with_config_home(&home, &xdg_config_home(&home), target_name, write_to_file)
     }
 
     /// Same as `connect`, but resolve config paths under `home` (tests use a temp home).
     pub fn connect_at(home: &Path, target_name: &str, write_to_file: bool) -> Result<String> {
+        Self::connect_with_config_home(home, &home.join(".config"), target_name, write_to_file)
+    }
+
+    fn connect_with_config_home(
+        home: &Path,
+        config_home: &Path,
+        target_name: &str,
+        write_to_file: bool,
+    ) -> Result<String> {
         let target = AgentTarget::parse(target_name);
-        let rendered = Self::render_config(&target)?;
+        // GUI clients may have no shell PATH. Persist the executable that
+        // actually ran this command; printed snippets remain portable.
+        let executable = if write_to_file {
+            Some(std::env::current_exe()?)
+        } else {
+            None
+        };
+        let command = match executable.as_ref() {
+            Some(path) => path.to_str().ok_or_else(|| {
+                AgentError::Config("MCP executable path is not valid UTF-8".into())
+            })?,
+            None => "02",
+        };
+        let rendered = Self::render_config_for(&target, command)?;
         if write_to_file {
-            if let Some(path) = target.config_path(home) {
+            if let Some(path) = target.config_path_in(home, config_home) {
                 if let Some(parent) = path.parent() {
                     if !parent.as_os_str().is_empty() {
                         fs::create_dir_all(parent)?;
@@ -135,7 +169,7 @@ impl AgentConnector {
                 }
                 let final_text = if path.exists() {
                     let existing_text = fs::read_to_string(&path)?;
-                    Self::merge_config_text(&target, &existing_text)?
+                    Self::merge_config_text_for(&target, &existing_text, command)?
                 } else {
                     rendered
                 };
@@ -160,23 +194,38 @@ impl AgentConnector {
 
     /// Merge the 02 server entry into an existing client config.
     pub fn merge_config_text(target: &AgentTarget, existing_text: &str) -> Result<String> {
+        Self::merge_config_text_for(target, existing_text, "02")
+    }
+
+    fn merge_config_text_for(
+        target: &AgentTarget,
+        existing_text: &str,
+        command: &str,
+    ) -> Result<String> {
         let written = if matches!(target, AgentTarget::Codex) {
             let mut doc = if existing_text.trim().is_empty() {
                 toml::Table::new()
             } else {
                 parse_codex(existing_text)?
             };
-            upsert_codex(&mut doc)?;
+            upsert_codex(&mut doc, command)?;
             toml::to_string_pretty(&doc)?
         } else {
-            merge_json(target, existing_text)?
+            merge_json(target, existing_text, command)?
         };
         require_valid_02(target, &written)?;
         Ok(written)
     }
 }
 
-fn merge_json(target: &AgentTarget, existing_text: &str) -> Result<String> {
+fn xdg_config_home(home: &Path) -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(".config"))
+}
+
+fn merge_json(target: &AgentTarget, existing_text: &str, command: &str) -> Result<String> {
     let mut existing: Value = if existing_text.trim().is_empty() {
         json!({})
     } else {
@@ -192,7 +241,7 @@ fn merge_json(target: &AgentTarget, existing_text: &str) -> Result<String> {
             "context_servers",
             json!({
                 "source": "custom",
-                "command": "02",
+                "command": command,
                 "args": ["mcp"],
                 "env": {}
             }),
@@ -202,7 +251,7 @@ fn merge_json(target: &AgentTarget, existing_text: &str) -> Result<String> {
             "mcp",
             json!({
                 "type": "local",
-                "command": ["02", "mcp"]
+                "command": [command, "mcp"]
             }),
         )?,
         AgentTarget::Codex => {
@@ -213,7 +262,7 @@ fn merge_json(target: &AgentTarget, existing_text: &str) -> Result<String> {
         _ => upsert_json_entry(
             root,
             "mcpServers",
-            json!({ "command": "02", "args": ["mcp"] }),
+            json!({ "command": command, "args": ["mcp"] }),
         )?,
     }
     serde_json::to_string_pretty(&existing)
@@ -275,7 +324,14 @@ fn json_entry_valid(target: &AgentTarget, value: &Value) -> bool {
         AgentTarget::OpenCode => {
             let entry = &value["mcp"]["02"];
             entry.get("type").and_then(|v| v.as_str()) == Some("local")
-                && command_array(entry, &["02", "mcp"])
+                && entry
+                    .get("command")
+                    .and_then(Value::as_array)
+                    .is_some_and(|args| {
+                        args.len() == 2
+                            && valid_command(args[0].as_str())
+                            && args[1].as_str() == Some("mcp")
+                    })
         }
         AgentTarget::Codex => false,
         _ => stdio_command(&value["mcpServers"]["02"]),
@@ -283,7 +339,11 @@ fn json_entry_valid(target: &AgentTarget, value: &Value) -> bool {
 }
 
 fn stdio_command(entry: &Value) -> bool {
-    entry.get("command").and_then(|v| v.as_str()) == Some("02") && command_args(entry, &["mcp"])
+    valid_command(entry.get("command").and_then(Value::as_str)) && command_args(entry, &["mcp"])
+}
+
+fn valid_command(command: Option<&str>) -> bool {
+    command.is_some_and(|command| command == "02" || Path::new(command).is_absolute())
 }
 
 fn command_args(entry: &Value, expected: &[&str]) -> bool {
@@ -300,26 +360,12 @@ fn command_args(entry: &Value, expected: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-fn command_array(entry: &Value, expected: &[&str]) -> bool {
-    entry
-        .get("command")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.len() == expected.len()
-                && arr
-                    .iter()
-                    .zip(expected)
-                    .all(|(value, want)| value.as_str() == Some(*want))
-        })
-        .unwrap_or(false)
-}
-
 fn parse_codex(text: &str) -> Result<toml::Table> {
     toml::from_str(text.strip_prefix('\u{feff}').unwrap_or(text))
         .map_err(|err| AgentError::Config(format!("invalid Codex config.toml: {err}")))
 }
 
-fn upsert_codex(doc: &mut toml::Table) -> Result<()> {
+fn upsert_codex(doc: &mut toml::Table, command: &str) -> Result<()> {
     let servers = doc
         .entry("mcp_servers")
         .or_insert_with(|| toml::Value::Table(toml::Table::new()))
@@ -330,7 +376,7 @@ fn upsert_codex(doc: &mut toml::Table) -> Result<()> {
         .or_insert_with(|| toml::Value::Table(toml::Table::new()))
         .as_table_mut()
         .ok_or_else(|| AgentError::Config("mcp_servers.02 must be a TOML table".into()))?;
-    entry.insert("command".into(), toml::Value::String("02".into()));
+    entry.insert("command".into(), toml::Value::String(command.into()));
     entry.insert(
         "args".into(),
         toml::Value::Array(vec![toml::Value::String("mcp".into())]),
@@ -347,7 +393,7 @@ fn codex_entry_valid(doc: &toml::Table) -> bool {
     else {
         return false;
     };
-    entry.get("command").and_then(toml::Value::as_str) == Some("02")
+    valid_command(entry.get("command").and_then(toml::Value::as_str))
         && entry
             .get("args")
             .and_then(toml::Value::as_array)

@@ -33,7 +33,11 @@ pub fn custom_ignored(rel: &Path, patterns: &[String]) -> bool {
             if name.is_empty() {
                 continue;
             }
-            if components.contains(&name) {
+            let name = name.trim_start_matches("./");
+            if (!name.contains('/') && components.contains(&name))
+                || (name.contains('/')
+                    && (joined == name || joined.starts_with(&format!("{name}/"))))
+            {
                 return true;
             }
         } else if joined == trimmed || joined.starts_with(&format!("{trimmed}/")) {
@@ -56,6 +60,27 @@ pub struct ScannedFile {
 }
 
 impl RepoScanner {
+    /// Hash the exact scan inputs, independent of mtimes and enumeration order.
+    pub fn scan_fingerprint(scanned: &[ScannedFile], config: &RepoConfig) -> String {
+        let mut hash = Sha256::new();
+        hash.update(b"02-index-snapshot-v1\0");
+        // RepoConfig has deterministic field ordering and contains all selection knobs.
+        hash.update(serde_json::to_vec(config).expect("RepoConfig is serializable"));
+        let mut files: Vec<_> = scanned.iter().map(|item| &item.file).collect();
+        files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        for file in files {
+            hash.update(file.relative_path.as_bytes());
+            hash.update([0]);
+            hash.update(file.file_hash.as_bytes());
+            hash.update([0]);
+        }
+        hex::encode(hash.finalize())
+    }
+
+    pub fn fingerprint(&self) -> String {
+        Self::scan_fingerprint(&self.scan(), &self.config)
+    }
+
     pub fn new<P: AsRef<Path>>(root: P, config: RepoConfig) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),

@@ -1,4 +1,5 @@
 # Apps SVG definitions for 02-OS
+from icons_browsers import get_browser_icons
 
 def get_app_icons():
     icons = {}
@@ -805,6 +806,7 @@ def get_app_icons():
     """
     icons["software-properties"] = (defs_software, "bg-soft", art_software)
 
+    icons.update(get_browser_icons())
     return icons
 
 print("icons_apps module ready.")

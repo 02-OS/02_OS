@@ -1,7 +1,7 @@
 use agent_core::{paths::StoragePaths, types::RepoId, Result};
 use agent_git::GitRepo;
-use agent_index::IndexDatabase;
-use agent_memory::{index_pipeline, MemoryStore, RepoHandle, StalenessEngine, TaskRegistry};
+use agent_index::{IndexDatabase, RepoScanner};
+use agent_memory::{index_pipeline, RepoHandle, TaskRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -16,6 +16,8 @@ static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WatchedState {
     pub repositories: HashSet<PathBuf>,
+    #[serde(default)]
+    pub opted_out_repositories: HashSet<PathBuf>,
 }
 
 pub struct RepoWatcher {
@@ -40,7 +42,7 @@ impl Drop for FileLock {
 impl RepoWatcher {
     pub fn new() -> Result<Self> {
         let dir = StoragePaths::data_dir()?;
-        fs::create_dir_all(&dir)?;
+        StoragePaths::ensure_private_dir(&dir)?;
         Self::with_state_file(dir.join("watched_repos.json"))
     }
 
@@ -71,11 +73,24 @@ impl RepoWatcher {
     }
 
     pub fn add(&self, path: PathBuf) -> Result<bool> {
+        self.register(path, true)
+    }
+
+    /// Automatic setup respects an explicit unwatch, including after restart.
+    pub fn register_automatic(&self, path: PathBuf) -> Result<bool> {
+        self.register(path, false)
+    }
+
+    fn register(&self, path: PathBuf, explicit: bool) -> Result<bool> {
         let _mu = lock_mutex(&self.state_mu);
         let _file = lock_file(&self.state_file)?;
         let mut state = read_state(&self.state_file)?;
+        if !explicit && state.opted_out_repositories.contains(&path) {
+            return Ok(false);
+        }
+        let enabled = explicit && state.opted_out_repositories.remove(&path);
         let inserted = state.repositories.insert(path);
-        if inserted {
+        if inserted || enabled {
             write_state(&self.state_file, &state)?;
         }
         Ok(inserted)
@@ -86,7 +101,8 @@ impl RepoWatcher {
         let _file = lock_file(&self.state_file)?;
         let mut state = read_state(&self.state_file)?;
         let removed = state.repositories.remove(path);
-        if removed {
+        let disabled = state.opted_out_repositories.insert(path.to_path_buf());
+        if removed || disabled {
             write_state(&self.state_file, &state)?;
         }
         Ok(removed)
@@ -129,13 +145,22 @@ impl RepoWatcher {
 
         let db = IndexDatabase::open(&db_path)?;
         let stats = db.get_stats(&repo_info.id)?;
-        let head_changed = stats.last_indexed_commit != repo_info.head_commit;
-        let current_fingerprint = git_repo.status_fingerprint()?;
+        let completed = db.completed_index(&repo_info.id)?;
+        let head_changed = completed
+            .as_ref()
+            .is_none_or(|state| state.head_commit != repo_info.head_commit);
+        let config = agent_core::RepoConfig::load_or_default(repo_path);
+        let current_fingerprint = RepoScanner::new(repo_path, config).fingerprint();
         let previous_head = stats.last_indexed_commit.clone();
         let dirty_changed = {
             let fps = self.fingerprint_lock();
             match fps.get(&repo_info.id) {
-                Some(fp) => fp != &current_fingerprint,
+                Some(fp) => {
+                    fp != &current_fingerprint
+                        || completed
+                            .as_ref()
+                            .is_none_or(|state| state.fingerprint != current_fingerprint)
+                }
                 // A clean current worktree can differ from the indexed snapshot: an
                 // untracked file may have been deleted, or dirty tracked content
                 // reverted, while the daemon was stopped. Establish the baseline
@@ -152,13 +177,9 @@ impl RepoWatcher {
         }
 
         let mut handle = RepoHandle::open(repo_path)?;
-        let indexed = (|| {
-            index_pipeline(&mut handle, false, &TaskRegistry::new())?;
-            let store = MemoryStore::for_repo(&handle.info.id)?;
-            StalenessEngine::evaluate(repo_path, &handle.info.id, &handle.git, &handle.db, &store)?;
-            Ok(())
-        })();
+        let indexed = index_pipeline(&mut handle, false, &TaskRegistry::new());
         if let Err(err) = indexed {
+            handle.db.invalidate_index(&handle.info.id)?;
             let mut info = handle.info.clone();
             info.head_commit = previous_head;
             let _ = handle.db.update_repo_info(&info);
@@ -253,7 +274,12 @@ fn write_state(state_file: &Path, state: &WatchedState) -> Result<()> {
         seq
     ));
     let write_result = (|| -> Result<()> {
-        let mut file = File::create(&tmp)?;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
         file.write_all(text.as_bytes())?;
         file.write_all(b"\n")?;
         file.sync_all()?;
@@ -267,5 +293,6 @@ fn write_state(state_file: &Path, state: &WatchedState) -> Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(err.into());
     }
+    File::open(parent)?.sync_all()?;
     Ok(())
 }

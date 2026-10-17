@@ -61,21 +61,31 @@ class InstallerPackageTests(unittest.TestCase):
         self.assertIn("gtk-theme='adw-gtk3-dark'", defaults)
         self.assertIn("cursor-theme='capitaine-cursors'", defaults)
         self.assertIn("font-name='Inter 11'", defaults)
-        self.assertIn("firefox.desktop", defaults)
+        self.assertIn("google-chrome.desktop", defaults)
+        self.assertNotIn("firefox.desktop", defaults)
         self.assertIn("Papirus", theme)
 
         required = {
             "adw-gtk-theme",
             "capitaine-cursors",
-            "firefox",
+            "git",
             "inter-font",
             "papirus-icon-theme",
+            "power-profiles-daemon",
+            "rtkit",
+            "vulkan-swrast",
+            "wl-clipboard",
+            "xorg-xprop",
         }
         installed = package_names(MANIFEST)
         iso = package_names(ISO_PACKAGES)
         self.assertEqual(len(installed), len(set(installed)))
         self.assertTrue(required <= set(installed), installed)
         self.assertTrue(required <= set(iso), "live ISO manifest is missing a default package")
+        self.assertNotIn("firefox", installed)
+        self.assertTrue({"google-chrome", "brave-bin"} <= set(iso))
+        self.assertTrue({"google-chrome", "brave-bin"}.isdisjoint(installed),
+                        "Image-local browser packages are installed by their verified payload helper")
 
         installer = (OVERLAY / "usr/local/bin/02os-install").read_text()
         self.assertIn("installed-packages.txt", installer)
@@ -111,15 +121,15 @@ class InstallerPackageTests(unittest.TestCase):
                 func = stmt.value.func
                 if isinstance(func, ast.Attribute):
                     calls.append(func.attr)
-        self.assertEqual(calls, ["_install_desktop_packages", "_provision", "_activate_theme"])
+        self.assertEqual(calls, ["_install_desktop_packages", "_provision", "arch_chroot", "_install_browsers", "_activate_theme"])
         install_calls = []
         for stmt in functions["on_install"].body:
             if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
                 func = stmt.value.func
                 if isinstance(func, ast.Attribute):
                     install_calls.append(func.attr)
-        self.assertEqual(install_calls, ["_provision", "_prepare_boot", "_configure_boot_branding",
-                                         "add_additional_packages", "_activate_theme"])
+        self.assertEqual(install_calls, ["add_additional_packages", "_provision", "_prepare_boot",
+                                         "_configure_boot_branding", "_activate_theme"])
 
 
 class InstalledLauncherTests(unittest.TestCase):
@@ -161,7 +171,7 @@ class InstalledLauncherTests(unittest.TestCase):
             self.assertFalse((target / "usr/share/applications/02os-install.desktop").exists())
             installed_defaults = (target / "etc/dconf/db/local.d/00-02os").read_text()
             self.assertNotIn("02os-install.desktop", installed_defaults)
-            self.assertIn("firefox.desktop", installed_defaults)
+            self.assertIn("google-chrome.desktop", installed_defaults)
             self.assertIn("gtk-theme='adw-gtk3-dark'", installed_defaults)
             compiled = (target / "etc/dconf/db/local").read_bytes()
             self.assertNotIn(b"02os-install.desktop", compiled)
@@ -180,6 +190,10 @@ class InstalledLauncherTests(unittest.TestCase):
         launcher = source / "usr/local/bin/pop-launcher"
         launcher.parent.mkdir(parents=True)
         launcher.write_text("launcher")
+        (launcher.parent / "02os-install-browsers").write_text("#!/bin/sh\nexit 0\n")
+        browser_manifest = source / "usr/local/share/02os/browser-repo/manifest.json"
+        browser_manifest.parent.mkdir(parents=True)
+        browser_manifest.write_text("fixture browser manifest")
         for ext in EXTENSIONS:
             ext_dir = source / "usr/share/gnome-shell/extensions" / ext
             ext_dir.mkdir(parents=True)
@@ -188,6 +202,10 @@ class InstalledLauncherTests(unittest.TestCase):
         portal.mkdir(parents=True)
         (portal / "extension.js").write_text("portal")
         for rel, contents in {
+            "usr/local/bin/02os-check-desktop": "#!/bin/sh\nexit 0\n",
+            "usr/local/share/02os/desktop-compatibility.json": "{}\n",
+            "etc/sysctl.d/99-02os-performance.conf": "vm.swappiness = 180\n",
+            "etc/systemd/zram-generator.conf": "[zram0]\nzram-size = ram / 2\n",
             "usr/lib/tmpfiles.d/02os-zero-portal.conf": "d /run/02os-zero-portal 0770 root gdm -\n",
             "usr/share/icons/hicolor/scalable/apps/02os-logo.svg": "<svg/>\n",
             "usr/share/pixmaps/02os-logo.svg": "<svg/>\n",
@@ -223,6 +241,10 @@ class InstalledLauncherTests(unittest.TestCase):
         wants = source / "etc/systemd/user/default.target.wants/02-agentd.service"
         wants.parent.mkdir(parents=True)
         wants.symlink_to("../../../../usr/lib/systemd/user/02-agentd.service")
+        for rel in ("usr/lib/02-agent/prepare-storage.sh", "usr/lib/systemd/user-generators/02-agent-storage"):
+            helper = source / rel
+            helper.parent.mkdir(parents=True, exist_ok=True)
+            helper.write_text("#!/bin/sh\nexit 0\n")
 
 
 if __name__ == "__main__":

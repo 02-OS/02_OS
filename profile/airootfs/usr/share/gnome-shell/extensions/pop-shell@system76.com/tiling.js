@@ -7,6 +7,7 @@ import * as Tags from './tags.js';
 import * as window from './window.js';
 import * as geom from './geom.js';
 import * as exec from './executor.js';
+import * as Maximization from './maximization.js';
 import Meta from 'gi://Meta';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 const { ShellWindow } = window;
@@ -559,7 +560,7 @@ export class Tiler {
                 return;
             this.window = win.entity;
             if (win.is_maximized()) {
-                win.meta.unmaximize(Meta.MaximizeFlags.BOTH);
+                Maximization.unmaximize(win.meta);
             }
             ext.set_overlay(win.rect());
             ext.overlay.visible = true;

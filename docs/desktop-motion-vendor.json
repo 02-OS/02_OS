@@ -1,5 +1,5 @@
 {
-  "target_shell": "50",
+  "target_shell": "51",
   "packages": [
     {
       "uuid": "dash-to-dock@micxgx.gmail.com",
@@ -9,7 +9,9 @@
       "sha256": "eb7647c03cad6dd1ac608da75ffdd2a2b9f8356b65bb468dc523d7ed3d26e5fc",
       "license": "GPL-2.0-or-later",
       "license_file": "COPYING",
-      "local_changes": ["Preserve the 02_OS icon hover fade at the end of stylesheet.css."]
+      "local_changes": [
+        "Preserve the 02_OS icon hover fade at the end of stylesheet.css."
+      ]
     },
     {
       "uuid": "flourish@orsso.github.io",
@@ -19,7 +21,10 @@
       "sha256": "9afa00b5adbdb7a555b854748315e809affe4cae79a8b770e4bfc2dcc024ea29",
       "license": "GPL-2.0-or-later",
       "license_file": "LICENSE",
-      "local_changes": []
+      "local_changes": [
+        "Disconnect actor callbacks before restoring translations and guard repeated disposal or queued callbacks during dock reconstruction.",
+        "Honor GNOME 51 reduced-motion preference across hover, launch and attention effects."
+      ]
     },
     {
       "uuid": "compiz-windows-effect@hermes83.github.com",
@@ -35,7 +40,8 @@
         "Gate unmaximize effects with maximize-effect, and use actor.meta_window consistently.",
         "Disconnect added handlers on disable and make overview cleanup repeatable.",
         "Clear the depth buffer before painting the flat mesh to keep window content visible on virtual/offscreen rendering targets.",
-        "Remove upstream trailing whitespace from bundled JavaScript files."
+        "Remove upstream trailing whitespace from bundled JavaScript files.",
+        "Declare GNOME 51 compatibility after API checks; honor the reduced-motion preference and stop active effects on changes."
       ]
     }
   ],
@@ -51,15 +57,29 @@
       "license_source": "https://raw.githubusercontent.com/pop-os/shell/master_noble/LICENSE",
       "snapshot_commit_verified": false,
       "inspected_upstream_head": "7898b65c20735057faf0797f8ed056704ca55f0d",
-      "content_sha256": "15a4e0b6f8bdf250d90494911b4f1b400e572ad29c2fd2fac650db6a10da1c0c",
-      "content_sha256_excludes": ["PROVENANCE.md"],
-      "files": ["window.js"],
+      "content_sha256": "f86e6f0b8705898ddfbc2c64460e5341e24a447ea3d321a64418c52730945637",
+      "content_sha256_excludes": [
+        "PROVENANCE.md"
+      ],
+      "files": [
+        "extension.js",
+        "launcher.js",
+        "maximization.js",
+        "panel_settings.js",
+        "search.js",
+        "tiling.js",
+        "window.js"
+      ],
       "local_changes": [
         "Recheck active-hint on each border timer tick so turning the outline off keeps it hidden.",
         "Escape user-selected floating-exception titles and classes, and match invalid persisted patterns literally.",
         "Compare both entity slot and generation, and allocate a fresh id when a slot is recycled.",
         "Drop a dead pop-launcher service on backend EOF so a later search can start a new one.",
-        "metadata.json lists shell-version 51 in addition to upstream master_noble versions 45-50."
+        "metadata.json lists shell-version 51 in addition to upstream master_noble versions 45-50.",
+        "Use St.BoxLayout orientation instead of the removed vertical property on GNOME 51.",
+        "Only synchronize the X11 window-title menu control when it exists, preserving decoration updates on Wayland.",
+        "Centralize full maximize/unmaximize calls: pass BOTH before Mutter 49 and no arguments on 49 or newer.",
+        "Activate an existing application window from launcher search instead of leaving it in the background."
       ]
     }
   ]

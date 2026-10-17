@@ -73,6 +73,8 @@ export default class CompizWindowsEffectExtension extends Extension {
         };
         this.animationSettingsId = this.animationSettings.connect(
             'notify::enable-animations', stopUnavailableMotion);
+        this.reducedMotionId = St.ReducedMotion ? this.animationSettings.connect(
+            'notify::reduced-motion', stopUnavailableMotion) : null;
         this.sessionModeId = Main.sessionMode.connect('updated', stopUnavailableMotion);
 
         this.grabOpBeginId = global.display.connect('grab-op-begin', (display, window, op) => {
@@ -189,6 +191,10 @@ export default class CompizWindowsEffectExtension extends Extension {
     }
 
     disable() {
+        if (this.reducedMotionId) {
+            this.animationSettings.disconnect(this.reducedMotionId);
+            this.reducedMotionId = null;
+        }
         if (this.animationSettingsId) {
             this.animationSettings.disconnect(this.animationSettingsId);
             this.animationSettingsId = null;
@@ -232,7 +238,9 @@ export default class CompizWindowsEffectExtension extends Extension {
     }
 
     motionAllowed() {
+        const reduced = this.animationSettings?.reduced_motion ?? this.animationSettings?.reducedMotion;
         return !!this.animationSettings?.enable_animations &&
+            (!St.ReducedMotion || reduced !== St.ReducedMotion.REDUCE) &&
             !Main.sessionMode.isLocked && !Main.sessionMode.isGreeter;
     }
 

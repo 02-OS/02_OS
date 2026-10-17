@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Install the image's verified native browser packages in the current system.
+
+Run this as root inside the live image or the installed target's chroot. There
+is deliberately no host --root/--target mode. Vendor verification happens when
+the local repository is built; its manifest binds transactions to those same
+package versions and bytes. --verify-only checks installed versions against
+the retained manifest without a package transaction or repository access.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+
+DEFAULT_REPO = Path("/usr/local/share/02os/browser-repo")
+PACMAN = "/usr/bin/pacman"
+PACMAN_CONF_TOOL = "/usr/bin/pacman-conf"
+PACMAN_CONF = Path("/etc/pacman.conf")
+TEMP_ROOT = "/run"
+REPO_NAME = "02os-browsers"
+PACKAGE_NAMES = ("google-chrome", "brave-bin")
+SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+_:\-]*\Z")
+FILENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+_\-]*\Z")
+DEPENDENCY = re.compile(r"[A-Za-z0-9@._+][A-Za-z0-9@._+:\-]*(?:[<>=]{1,2}[A-Za-z0-9][A-Za-z0-9.+_:\-]*)?\Z")
+
+
+def checked_file(repo, filename, digest):
+    if not isinstance(filename, str) or not FILENAME.fullmatch(filename):
+        raise ValueError("Browser repository contains an invalid filename")
+    if not isinstance(digest, str) or not SHA256.fullmatch(digest):
+        raise ValueError(f"Browser repository has no valid SHA-256 for {filename}")
+    path = repo / filename
+    if path.is_symlink() or not path.is_file() or path.resolve() != path:
+        raise ValueError(f"Browser repository file is missing or not a regular local file: {filename}")
+    sha = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            sha.update(block)
+    if sha.hexdigest() != digest:
+        raise ValueError(f"Browser repository SHA-256 mismatch: {filename}")
+    return path
+
+
+def check_database(path, packages):
+    """Check metadata without extracting any archive member to the filesystem."""
+    expected = {package["name"]: package for package in packages}
+    found = set()
+    dependencies = set()
+    with tarfile.open(path, "r:gz") as database:
+        for member in database:
+            if not member.isfile() or Path(member.name).name != "desc":
+                continue
+            if member.size > 1024 * 1024:
+                raise ValueError("Browser repository database entry is too large")
+            stream = database.extractfile(member)
+            if stream is None:
+                raise ValueError("Browser repository database entry is unreadable")
+            fields = {}
+            for block in stream.read().decode("utf-8").strip().split("\n\n"):
+                lines = block.splitlines()
+                if lines and lines[0].startswith("%"):
+                    fields[lines[0]] = lines[1:]
+            names = fields.get("%NAME%", [])
+            if len(names) != 1 or names[0] not in expected or names[0] in found:
+                raise ValueError("Browser repository database has unexpected or duplicate packages")
+            name = names[0]
+            package = expected[name]
+            for field, value in (("%VERSION%", package["version"]),
+                                 ("%FILENAME%", package["filename"]),
+                                 ("%SHA256SUM%", package["sha256"]),
+                                 ("%ARCH%", "x86_64")):
+                if fields.get(field) != [value]:
+                    raise ValueError(f"Browser repository database disagrees with manifest: {name} {field}")
+            for dependency in fields.get("%DEPENDS%", []):
+                if not DEPENDENCY.fullmatch(dependency):
+                    raise ValueError(f"Browser repository has an invalid dependency: {name}")
+                dependencies.add(dependency)
+            found.add(name)
+    if found != set(expected):
+        raise ValueError("Browser repository database is missing a required browser")
+    return sorted(dependencies)
+
+
+def read_manifest(repo):
+    repo = Path(repo).absolute()
+    if repo.is_symlink() or not repo.is_dir() or repo.resolve() != repo:
+        raise ValueError("Browser repository must be an existing local directory without symlinks")
+    manifest_path = repo / "manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError("Browser repository manifest.json is missing or not a regular file")
+    if manifest_path.stat().st_size > 1024 * 1024:
+        raise ValueError("Browser repository manifest is too large")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or manifest.get("format_version") != 1 or manifest.get("architecture") != "x86_64":
+        raise ValueError("Browser repository manifest format or architecture is unsupported")
+    packages = manifest.get("packages")
+    if not isinstance(packages, list) or len(packages) != len(PACKAGE_NAMES):
+        raise ValueError("Browser repository must contain Chrome and Brave")
+    found = set()
+    for package in packages:
+        if not isinstance(package, dict):
+            raise ValueError("Browser repository package entry is invalid")
+        name = package.get("name")
+        version = package.get("version")
+        if not isinstance(name, str) or name not in PACKAGE_NAMES or name in found:
+            raise ValueError("Browser repository contains an unexpected or duplicate package")
+        if not isinstance(version, str) or not VERSION.fullmatch(version):
+            raise ValueError(f"Browser repository has an invalid package version: {name}")
+        filename = package.get("filename")
+        if (not isinstance(filename, str) or not FILENAME.fullmatch(filename)
+                or not filename.startswith(name + "-") or not filename.endswith("-x86_64.pkg.tar.zst")):
+            raise ValueError(f"Browser repository has an invalid package filename: {name}")
+        if not isinstance(package.get("sha256"), str) or not SHA256.fullmatch(package["sha256"]):
+            raise ValueError(f"Browser repository has no valid SHA-256 for {filename}")
+        found.add(name)
+    repository = manifest.get("repository")
+    if not isinstance(repository, dict) or repository.get("name") != REPO_NAME:
+        raise ValueError("Browser repository metadata is missing")
+    if repository.get("filename") != REPO_NAME + ".db.tar.gz" or repository.get("database_filename") != REPO_NAME + ".db":
+        raise ValueError("Browser repository database filenames are invalid")
+    for key in ("sha256", "database_sha256"):
+        if not isinstance(repository.get(key), str) or not SHA256.fullmatch(repository[key]):
+            raise ValueError("Browser repository has no valid database SHA-256")
+    if repository["sha256"] != repository["database_sha256"]:
+        raise ValueError("Browser repository database and archive differ")
+    return repo, {package["name"]: package for package in packages}, repository
+
+
+def validate_repository(repo):
+    repo, packages, repository = read_manifest(repo)
+    for package in packages.values():
+        checked_file(repo, package["filename"], package["sha256"])
+    archive = checked_file(repo, repository["filename"], repository["sha256"])
+    checked_file(repo, repository["database_filename"], repository["database_sha256"])
+    dependencies = check_database(archive, packages.values())
+    return repo, packages, dependencies
+
+
+def installed_versions():
+    result = subprocess.run([PACMAN, "--query", *PACKAGE_NAMES], check=False,
+                            text=True, capture_output=True)
+    installed = dict(line.split(maxsplit=1) for line in result.stdout.splitlines() if line.strip())
+    return result.returncode, installed
+
+
+def check_installed(packages, returncode, installed):
+    for name in PACKAGE_NAMES:
+        if installed.get(name) != packages[name]["version"]:
+            raise ValueError(f"Installed browser version differs from the image manifest: {name}")
+    if returncode:
+        raise ValueError("Failed to query installed browser versions")
+    for name in PACKAGE_NAMES:
+        print(f"02os-install-browsers: {name} {installed[name]}")
+
+
+def missing_dependencies(dependencies):
+    if not dependencies:
+        return []
+    result = subprocess.run([PACMAN, "--deptest", *dependencies], check=False,
+                            text=True, capture_output=True)
+    missing = result.stdout.splitlines()
+    # pacman -T returns 127 only for unsatisfied dependencies. Configuration,
+    # database, or invocation failures must not trigger a network transaction.
+    if result.returncode not in (0, 127) or (result.returncode == 0 and missing):
+        raise ValueError("Failed to check installed browser dependencies")
+    if result.returncode == 127 and (not missing or any(item not in dependencies for item in missing)):
+        raise ValueError("Dependency check returned unexpected browser dependencies")
+    return missing
+
+
+def local_package_config():
+    # Resolve Include directives with pacman's own parser, preserving DBPath,
+    # hooks, exclusions, and global signature policy. Keep only [options], so
+    # -U cannot download dependencies even if the installed state changes.
+    result = subprocess.run([PACMAN_CONF_TOOL, "--config", str(PACMAN_CONF)], check=True,
+                            text=True, capture_output=True)
+    options = []
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped != "[options]":
+            break
+        if not re.match(r"^LocalFileSigLevel\s*=", stripped):
+            options.append(line)
+    if not options or options[0].strip() != "[options]":
+        raise ValueError("pacman-conf did not return resolved options")
+    # This exception applies only to the two local archives whose exact bytes
+    # were hash-verified above. Official packages use the untouched system
+    # configuration in their separate full-upgrade transaction.
+    return "\n".join(options) + "\nLocalFileSigLevel = Optional TrustAll\n"
+
+
+def install_browsers(repo=DEFAULT_REPO, *, verify_only=False):
+    if os.geteuid() != 0:
+        raise PermissionError("Run 02os-install-browsers as root inside the live image or installed target's chroot")
+    if verify_only:
+        # The image build has already installed the packages through pacstrap.
+        # Installed targets retain the manifest after removing cached archives.
+        # Neither path needs mirrors, an initialized keyring, or a writable /run.
+        _, packages, _ = read_manifest(repo)
+        check_installed(packages, *installed_versions())
+        return
+    repo, packages, dependencies = validate_repository(repo)
+    returncode, installed = installed_versions()
+    if not returncode and all(installed.get(name) == packages[name]["version"] for name in PACKAGE_NAMES):
+        check_installed(packages, returncode, installed)
+        return
+    config = PACMAN_CONF.read_text(encoding="utf-8")
+    if re.search(r"^\s*\[02os-browsers\]\s*(?:#.*)?$", config, re.MULTILINE):
+        raise ValueError("The system pacman configuration already defines 02os-browsers; remove the stale build-only repository")
+    missing = missing_dependencies(dependencies)
+    if missing:
+        # Choose this branch before any transaction. Never recover from an
+        # arbitrary failed -Syu by attempting a partial/offline installation.
+        subprocess.run([PACMAN, "--config", str(PACMAN_CONF), "--sync", "--refresh", "--sysupgrade",
+                        "--needed", "--noconfirm", *missing], check=True)
+        if missing_dependencies(dependencies):
+            raise ValueError("Browser dependencies remain unsatisfied after system upgrade")
+    with tempfile.TemporaryDirectory(prefix="02os-browsers-", dir=TEMP_ROOT) as temporary:
+        config_path = Path(temporary) / "pacman.conf"
+        config_path.write_text(local_package_config(), encoding="utf-8")
+        targets = [str(repo / packages[name]["filename"]) for name in PACKAGE_NAMES]
+        subprocess.run([PACMAN, "--config", str(config_path), "--upgrade",
+                        "--needed", "--noconfirm", *targets], check=True)
+    # A successful transaction must leave both exact image versions installed.
+    check_installed(packages, *installed_versions())
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", type=Path, default=DEFAULT_REPO,
+                        help=f"Verified image-local repository (default: {DEFAULT_REPO})")
+    parser.add_argument("--verify-only", action="store_true",
+                        help="Check installed manifest versions without installing or accessing repositories")
+    args = parser.parse_args()
+    try:
+        install_browsers(args.repo, verify_only=args.verify_only)
+    except (OSError, ValueError, tarfile.TarError, subprocess.CalledProcessError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

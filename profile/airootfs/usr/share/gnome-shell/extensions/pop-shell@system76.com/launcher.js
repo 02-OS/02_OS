@@ -192,6 +192,12 @@ export class Launcher extends search.Search {
             this.launch_desktop_app(dapp, entry.path);
             return;
         }
+        // Shell.App activation selects and focuses an existing window, even
+        // on another workspace. launch() would request another instance.
+        if (app.get_windows().length > 0) {
+            app.activate();
+            return;
+        }
         const info = app.get_app_info();
         if (!info) {
             log.error(`cannot find app info for ${desktop_entry_id}`);

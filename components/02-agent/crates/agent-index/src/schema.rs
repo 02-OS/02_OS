@@ -1,4 +1,16 @@
-pub const CURRENT_SCHEMA_VERSION: i32 = 3;
+pub const CURRENT_SCHEMA_VERSION: i32 = 4;
+
+/// A repository observation is not proof of a successful index. Legacy rows
+/// deliberately acquire no completion marker until their next full sync.
+pub const SCHEMA_V4_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS completed_index_state (
+    repo_id TEXT PRIMARY KEY,
+    head_commit TEXT,
+    fingerprint TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    FOREIGN KEY(repo_id) REFERENCES repositories(repo_id) ON DELETE CASCADE
+);
+"#;
 
 /// Schema written by runtime versions that only knew the file/symbol catalog.
 pub const SCHEMA_V1_SQL: &str = r#"

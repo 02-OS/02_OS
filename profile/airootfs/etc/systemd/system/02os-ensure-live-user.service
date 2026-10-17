@@ -1,7 +1,7 @@
 [Unit]
 Description=Ensure 02_OS live user and group
 After=systemd-sysusers.service
-Before=gdm.service display-manager.service greetd.service
+Before=systemd-user-sessions.service gdm.service display-manager.service greetd.service
 
 [Service]
 Type=oneshot
