@@ -15,7 +15,7 @@ import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
-IMAGE = "02os-boot-proof-kvm-ubuntu:20261007"
+IMAGE = "02os-acceptance-runner:local"
 
 
 def save(path, value):
@@ -81,6 +81,8 @@ def docker(*args):
 def prepare(args):
     for address in args.dns:
         ipaddress.ip_address(address)
+    if bool(args.firmware_code) != bool(args.firmware_vars):
+        raise ValueError("Provide both matching firmware templates, or use the runner image defaults")
     iso = args.iso.resolve(strict=True)
     manifest = json.loads(Path(str(iso) + ".manifest.json").read_text())
     subprocess.run(["python3", str(ROOT / "scripts/iso-manifest.py"), "verify", str(iso), manifest["revision"]], check=True)
@@ -90,19 +92,29 @@ def prepare(args):
     run = args.runs_root.resolve() / (time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6])
     run.mkdir(mode=0o700)
     identity = uuid.uuid4().hex[:12]
-    metadata = {"image": args.runner_image, "iso": str(iso), "iso_revision": manifest["revision"],
+    runner_image = docker("image", "inspect", "--format", "{{.Id}}", args.runner_image)
+    metadata = {"image": runner_image, "image_reference": args.runner_image,
+                "iso": str(iso), "iso_revision": manifest["revision"],
                 "iso_sha256": manifest["sha256"], "firmware": args.firmware, "graphics": args.graphics,
                 "serial": "02TEST-" + identity, "name": "02os-acceptance-" + identity,
                 "installed": False, "host_block_devices": False, "host_filesystem_shares": False,
                 "dns": args.dns}
     docker("run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
            "--mount", f"type=bind,src={run},dst=/run-test", "--entrypoint", "/usr/bin/qemu-img",
-           args.runner_image, "create", "-f", "qcow2", "/run-test/disk.qcow2", "32G")
+           runner_image, "create", "-f", "qcow2", "/run-test/disk.qcow2", "32G")
     if args.firmware == "uefi":
-        if not args.firmware_code or not args.firmware_vars:
-            raise ValueError("UEFI requires explicit matching firmware code and variable template paths")
-        for path, destination in ((args.firmware_code, "OVMF_CODE.fd"), (args.firmware_vars, "OVMF_VARS.fd")):
-            shutil.copyfile(path.resolve(strict=True), run / destination)
+        if args.firmware_code:
+            for path, destination in ((args.firmware_code, "OVMF_CODE.fd"), (args.firmware_vars, "OVMF_VARS.fd")):
+                shutil.copyfile(path.resolve(strict=True), run / destination)
+        else:
+            docker("run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
+                   "--mount", f"type=bind,src={run},dst=/run-test", "--entrypoint", "/bin/sh",
+                   runner_image, "-ec",
+                   "cp /usr/share/OVMF/OVMF_CODE_4M.fd /run-test/OVMF_CODE.fd\n"
+                   "cp /usr/share/OVMF/OVMF_VARS_4M.fd /run-test/OVMF_VARS.fd")
+        metadata["firmware_template_sha256"] = {
+            name: hashlib.sha256((run / name).read_bytes()).hexdigest()
+            for name in ("OVMF_CODE.fd", "OVMF_VARS.fd")}
     save(run / "metadata.json", metadata)
     print(run, flush=True)
 
