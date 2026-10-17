@@ -186,7 +186,14 @@ copy_entry() {
     return 0
   fi
   assert_inside "${src}"
-  assert_target_inside "${dest}"
+  if [[ -L "${src}" ]]; then
+    # Replace a project-owned link itself, including absolute links created by
+    # systemctl. Never resolve its existing leaf against the live host root.
+    # Parent redirects still have to remain inside the installed target.
+    assert_target_inside "$(dirname -- "${dest}")"
+  else
+    assert_target_inside "${dest}"
+  fi
   case "${rel}" in
     usr/local/bin/02os-install-browsers|usr/local/share/02os/browser-repo|usr/local/share/02os/browser-repo/*)
       assert_browser_target_path "${dest}"
@@ -209,7 +216,13 @@ copy_entry() {
     fi
   else
     mkdir -p -- "$(dirname -- "${dest}")"
-    if [[ "${rel}" == "etc/os-release" ]]; then
+    if [[ -L "${src}" ]]; then
+      if [[ -d "${dest}" && ! -L "${dest}" ]]; then
+        echo "ERROR: refusing to replace directory with symlink: ${dest}" >&2
+        return 1
+      fi
+      cp -a --remove-destination -- "${src}" "${dest}"
+    elif [[ "${rel}" == "etc/os-release" ]]; then
       # The base system ships /etc/os-release as a symlink to its vendor file.
       # Replace both paths so neither one still names another operating system.
       local vendor="${target_canon}/usr/lib/os-release"

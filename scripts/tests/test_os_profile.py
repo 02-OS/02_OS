@@ -501,6 +501,50 @@ class OSProfileTests(unittest.TestCase):
             self.assertFalse((bare_target / "usr/bin/02").exists())
             self.assertFalse((bare_target / "usr/share/applications/02os-install.desktop").exists())
 
+    def test_repeated_provisioning_replaces_service_link_without_following_its_leaf(self):
+        provision = OVERLAY / "usr/local/bin/02os-provision"
+        with tempfile.TemporaryDirectory(prefix="02os-repeat-service-") as tmp:
+            source, target = Path(tmp) / "source", Path(tmp) / "target"
+            self._write_provision_fixture(source, include_runtime=True)
+            relative = "etc/systemd/user/default.target.wants/02-agentd.service"
+            destination = target / relative
+            destination.parent.mkdir(parents=True)
+            destination.symlink_to("/usr/lib/systemd/user/02-agentd.service")
+            outside = Path(tmp) / "outside-service"
+            outside.write_text("preserve outside data\n")
+            for existing in (None, outside, None):
+                if existing is not None:
+                    destination.unlink()
+                    destination.symlink_to(existing)
+                result = subprocess.run([str(provision), "--source", str(source), "--target", str(target)],
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(destination.is_symlink())
+                self.assertEqual(destination.readlink(), (source / relative).readlink())
+                self.assertEqual(outside.read_text(), "preserve outside data\n")
+
+    def test_service_link_copy_rejects_redirected_parent_or_directory_leaf(self):
+        provision = OVERLAY / "usr/local/bin/02os-provision"
+        for kind in ("parent", "directory"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(prefix="02os-service-guard-") as tmp:
+                source, target = Path(tmp) / "source", Path(tmp) / "target"
+                self._write_provision_fixture(source, include_runtime=True)
+                parent = target / "etc/systemd/user/default.target.wants"
+                if kind == "parent":
+                    outside = Path(tmp) / "outside"
+                    outside.mkdir()
+                    sentinel = outside / "02-agentd.service"
+                    parent.parent.mkdir(parents=True)
+                    parent.symlink_to(outside)
+                else:
+                    sentinel = parent / "02-agentd.service/preserve"
+                    sentinel.parent.mkdir(parents=True)
+                sentinel.write_text("preserve existing data\n")
+                result = subprocess.run([str(provision), "--source", str(source), "--target", str(target)],
+                                        capture_output=True, text=True, timeout=30)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(sentinel.read_text(), "preserve existing data\n")
+
     def test_provisioner_stages_browser_archives_only_in_explicit_final_phase(self):
         provision = OVERLAY / "usr/local/bin/02os-provision"
         with tempfile.TemporaryDirectory(prefix="02os-browser-copy-") as tmp:
