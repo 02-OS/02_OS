@@ -134,8 +134,11 @@ active-hint=false
 hint-color-rgba='rgba(0,0,0,0)'
 show-title=true
 toggle-tiling=['<Super>y']
+# Reserve Super+L for the screen lock, including after extension re-enable.
+focus-right=['<Super>Right', '<Super>KP_Right']
 
 [org/gnome/settings-daemon/plugins/media-keys]
+screensaver=['<Super>l']
 custom-keybindings=['/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/', '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom1/']
 
 [org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0]

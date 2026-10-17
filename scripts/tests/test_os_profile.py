@@ -407,6 +407,15 @@ class OSProfileTests(unittest.TestCase):
         combined = result.stdout + result.stderr
         self.assertNotIn("ignoring", combined.lower(), combined)
 
+    def test_lock_shortcut_does_not_overlap_pop_shell_focus_bindings(self):
+        defaults = configparser.ConfigParser(interpolation=None)
+        defaults.read(OVERLAY / "etc/dconf/db/local.d/00-02os")
+        lock = set(ast.literal_eval(defaults["org/gnome/settings-daemon/plugins/media-keys"]["screensaver"]))
+        focus_right = set(ast.literal_eval(defaults["org/gnome/shell/extensions/pop-shell"]["focus-right"]))
+        self.assertIn("<Super>l", lock)
+        self.assertIn("<Super>Right", focus_right)
+        self.assertFalse(lock & focus_right, "Window focus must not intercept screen locking")
+
     def test_provisioner_copies_allowlist_and_skips_live_paths(self):
         provision = OVERLAY / "usr/local/bin/02os-provision"
         with tempfile.TemporaryDirectory(prefix="02os-prov-") as tmp:

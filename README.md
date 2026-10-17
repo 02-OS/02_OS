@@ -135,6 +135,9 @@ These effects ship in new builds from this source. The previously tested
 | **Super** | Overview / App Launcher |
 | **Super+1..4** | Switch workspaces |
 
+**Super+L** locks the screen. Use **Super+Right** to focus the window to the right;
+Pop Shell's conflicting Super+L focus alias is disabled, including after extension re-enable.
+
 ---
 
 ## Performance & Optimization
