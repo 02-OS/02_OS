@@ -3,6 +3,7 @@
 import argparse
 import base64
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -36,8 +37,14 @@ class JsonSocket:
             self.call("qmp_capabilities")
         else:
             token = int(time.time_ns() % (2**60))
-            self.connection.sendall(b"\xff")
-            self.call("guest-sync-delimited", {"id": token})
+            request = {"execute": "guest-sync-delimited", "arguments": {"id": token}}
+            self.connection.sendall(b"\xff" + json.dumps(request).encode() + b"\n")
+            deadline = time.monotonic() + 10
+            # The flush byte can produce a parser error. Old replies can also
+            # remain on this persistent channel; ignore both until our token.
+            while self.receive().get("return") != token:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Guest-agent synchronization timed out")
 
     def receive(self):
         while True:
@@ -72,6 +79,8 @@ def docker(*args):
 
 
 def prepare(args):
+    for address in args.dns:
+        ipaddress.ip_address(address)
     iso = args.iso.resolve(strict=True)
     manifest = json.loads(Path(str(iso) + ".manifest.json").read_text())
     subprocess.run(["python3", str(ROOT / "scripts/iso-manifest.py"), "verify", str(iso), manifest["revision"]], check=True)
@@ -84,7 +93,8 @@ def prepare(args):
     metadata = {"image": args.runner_image, "iso": str(iso), "iso_revision": manifest["revision"],
                 "iso_sha256": manifest["sha256"], "firmware": args.firmware, "graphics": args.graphics,
                 "serial": "02TEST-" + identity, "name": "02os-acceptance-" + identity,
-                "installed": False, "host_block_devices": False, "host_filesystem_shares": False}
+                "installed": False, "host_block_devices": False, "host_filesystem_shares": False,
+                "dns": args.dns}
     docker("run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
            "--mount", f"type=bind,src={run},dst=/run-test", "--entrypoint", "/usr/bin/qemu-img",
            args.runner_image, "create", "-f", "qcow2", "/run-test/disk.qcow2", "32G")
@@ -154,6 +164,9 @@ def start(run, phase):
         qemu += ["-boot", "order=c,menu=on"]
     args = ["run", "--rm", "-d", "--name", data["name"], "--user", f"{os.getuid()}:{os.getgid()}",
             "--mount", f"type=bind,src={run},dst={run}"]
+    for address in data.get("dns", []):
+        ipaddress.ip_address(address)
+        args += ["--dns", address]
     for device in devices:
         args += ["--device", device, "--group-add", str(os.stat(device).st_gid)]
     if phase != "disk":
@@ -221,6 +234,7 @@ def main():
     prep.add_argument("--iso", type=Path, required=True)
     prep.add_argument("--runs-root", type=Path, required=True)
     prep.add_argument("--runner-image", default=IMAGE)
+    prep.add_argument("--dns", action="append", default=[], help="Upstream DNS address for the runner container; repeatable")
     prep.add_argument("--firmware", choices=("uefi", "bios"), default="uefi")
     prep.add_argument("--graphics", choices=("software", "gl"), default="software")
     prep.add_argument("--firmware-code", type=Path)

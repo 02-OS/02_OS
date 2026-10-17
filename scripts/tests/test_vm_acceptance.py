@@ -3,12 +3,60 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import socket
+import tempfile
+import threading
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("vm_guest_checks", ROOT / "scripts/vm/guest_checks.py")
 guest = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(guest)
+runner_spec = importlib.util.spec_from_file_location("vm_runner", ROOT / "scripts/vm/runner.py")
+runner = importlib.util.module_from_spec(runner_spec)
+runner_spec.loader.exec_module(runner)
+
+
+class GuestAgentProtocolTests(unittest.TestCase):
+    def test_sync_discards_flush_errors_and_stale_replies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "agent.sock"
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(str(path))
+            server.listen(1)
+            failures = []
+
+            def agent():
+                try:
+                    connection, _ = server.accept()
+                    with connection, connection.makefile("rwb") as stream:
+                        request = stream.readline()
+                        self.assertEqual(request[:1], b"\xff")
+                        token = json.loads(request[1:])["arguments"]["id"]
+                        stream.write(b'{"error":{"desc":"stray flush byte"}}\n')
+                        stream.write(json.dumps({"return": token - 1}).encode() + b"\n")
+                        stream.write(b"\xff" + json.dumps({"return": token}).encode() + b"\n")
+                        stream.flush()
+                        self.assertEqual(json.loads(stream.readline())["execute"], "guest-ping")
+                        stream.write(b'{"return":{}}\n')
+                        stream.flush()
+                except BaseException as error:
+                    failures.append(error)
+
+            thread = threading.Thread(target=agent, daemon=True)
+            thread.start()
+            try:
+                client = runner.JsonSocket(path)
+                try:
+                    self.assertEqual(client.call("guest-ping"), {})
+                finally:
+                    client.close()
+            finally:
+                thread.join(timeout=2)
+                server.close()
+            self.assertFalse(thread.is_alive())
+            if failures:
+                raise failures[0]
 
 
 class DisposableDiskTests(unittest.TestCase):

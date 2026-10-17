@@ -6,6 +6,9 @@ is `02os-boot-proof-kvm-ubuntu:20261007`; the image must contain
 `/usr/bin/qemu-system-x86_64` and `/usr/bin/qemu-img`. It receives only its fresh
 run directory, a read-only ISO, `/dev/kvm`, and the selected GPU render device
 for accelerated graphics. It receives no host block device or host home share.
+If the host's first DNS resolver cannot be reached from Docker, supply a
+reachable upstream address with `prepare --dns ADDRESS`. QEMU's DNS forwarding
+uses the container resolver; this option changes only the disposable runner.
 
 Prepare a run with a completed new ISO and an empty evidence directory:
 
@@ -24,6 +27,11 @@ sign in using the live account before checking desktop extension state. Guest
 snapshots collect package versions, service state, extension state, networking,
 audio sinks, and the portal result. They are evidence, not an automatic claim
 that every visual or hardware acceptance check passed.
+Some QEMU/virgl combinations report `no surface` for host screenshots after
+the guest switches to accelerated scanout. In that case, use GNOME's
+`Shift+Print` shortcut after login and retain the resulting image from the
+guest's `Pictures/Screenshots` directory. Do not treat a missing host capture
+as proof of a working or failed guest display.
 
 For a fresh UEFI run, `install` loads the canonical installed-VM credentials,
 hashes the password, verifies the only persistent guest disk's serial/size and

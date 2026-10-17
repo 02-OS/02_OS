@@ -98,7 +98,7 @@ def snapshot(username):
         "journal": ["journalctl", "-b", "--no-pager", "-n", "200"],
         "runtime": ["02", "--version"],
         "network": ["getent", "hosts", "archlinux.org"],
-        "zram": ["zramctl", "--output-all", "--json"],
+        "zram": ["zramctl", "--output-all", "--raw"],
     }
     result = {name: command(args) for name, args in checks.items()}
     try:
