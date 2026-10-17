@@ -19,7 +19,8 @@ def check(root, installer=False):
     contract = json.loads((root / "usr/local/share/02os/desktop-compatibility.json").read_text())
     if installer:
         version = package_version(root, "archinstall")
-        if ".".join(version.split(".")[:2]) != contract["archinstall"]:
+        upstream = version.rsplit("-", 1)[0]
+        if ".".join(upstream.split(".")[:2]) != contract["archinstall"]:
             raise ValueError(f"02_OS requires archinstall {contract['archinstall']}, found {version}")
         from archinstall.lib.installer import Installer
         for method, parameters in contract["installer_api"].items():

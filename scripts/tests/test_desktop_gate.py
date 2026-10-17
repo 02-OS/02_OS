@@ -71,6 +71,8 @@ class DesktopGateTests(unittest.TestCase):
         modules["archinstall.lib.installer"].Installer = Installer
         with patch.dict("sys.modules", modules):
             self.assertEqual(gate.check(self.root, True), {"archinstall": "4.5.3-1"})
+            self.versions["archinstall"] = "4.5-1"
+            self.assertEqual(gate.check(self.root, True), {"archinstall": "4.5-1"})
             self.versions["archinstall"] = "4.6.0-1"
             with self.assertRaisesRegex(ValueError, "requires archinstall"):
                 gate.check(self.root, True)
