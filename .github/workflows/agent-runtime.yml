@@ -3,7 +3,7 @@ name: agent-runtime
 on:
   pull_request:
   push:
-    branches: [master]
+    branches: [main, master]
 
 permissions:
   contents: read

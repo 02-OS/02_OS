@@ -4,10 +4,11 @@ Every pull request runs three jobs: `check` (Rust formatting, strict Clippy, and
 the workspace tests), `os-profile` (ISO-overlay validation), and `runtime-smoke`
 (the built CLI and MCP process against disposable repositories).
 
-Configure the repository ruleset or branch protection for `master` to require
+Configure the repository ruleset or branch protection for `main` (or `master`
+where it remains the default branch) to require
 **all three check names** before merging. Workflows running on a pull request
 do not themselves prevent a merge. Keep the existing review requirement and
-require branches to be current with `master` if that matches the project policy.
+require branches to be current with the protected branch if that matches the project policy.
 The test PR does not change repository settings.
 
 ## Running the checks locally
