@@ -11,7 +11,18 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-BINARY = Path(os.environ.get("AGENT_BINARY", ROOT / "components/02-agent/target/debug/02")).resolve()
+def _default_agent_binary():
+    for candidate in (
+        ROOT / "vendor/agent-runtime/target/debug/02",
+        ROOT.parent / "agent-runtime/target/debug/02",
+        ROOT / "components/02-agent/target/debug/02",
+    ):
+        if candidate.is_file():
+            return candidate
+    return ROOT.parent / "agent-runtime/target/debug/02"
+
+
+BINARY = Path(os.environ.get("AGENT_BINARY", _default_agent_binary())).resolve()
 
 
 class RuntimeSmokeTests(unittest.TestCase):

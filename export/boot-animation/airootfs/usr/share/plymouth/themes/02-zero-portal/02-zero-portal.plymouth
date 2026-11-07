@@ -1,8 +1,0 @@
-[Plymouth Theme]
-Name=02 Zero Portal
-Description=Native 02 logo followed by the boot-only GNOME portal reveal
-ModuleName=script
-
-[script]
-ImageDir=/usr/share/plymouth/themes/02-zero-portal
-ScriptFile=/usr/share/plymouth/themes/02-zero-portal/02-zero-portal.script

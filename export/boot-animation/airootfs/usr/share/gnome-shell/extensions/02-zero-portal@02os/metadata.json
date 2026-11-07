@@ -1,8 +1,0 @@
-{
-  "uuid": "02-zero-portal@02os",
-  "name": "02 Zero Portal",
-  "description": "A once-per-boot decorative reveal of the real 02_OS login screen.",
-  "shell-version": ["50", "51"],
-  "session-modes": ["gdm"],
-  "version": 1
-}

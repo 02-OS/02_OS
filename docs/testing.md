@@ -13,12 +13,12 @@ The test PR does not change repository settings.
 ## Running the checks locally
 
 ```bash
-cd components/02-agent
+cd ../agent-runtime
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 cargo build --locked --workspace
-cd ../..
+cd -
 python3 -m unittest discover -s scripts/tests -v
 ```
 

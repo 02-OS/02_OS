@@ -39,6 +39,8 @@ fi
 
 # ./build.sh is the only supported image build. Stage from source, prove the
 # staged binaries match that build, then stamp the tree mkarchiso will copy.
+echo "Staging appearance (${APPEARANCE_VARIANT:-01}) and the boot animation..."
+"${SCRIPT_DIR}/scripts/stage-components.sh"
 echo "Building and staging 02 Agent Runtime (02, 02agent, 02-agentd)..."
 "${SCRIPT_DIR}/scripts/build-agent-runtime.sh"
 "${SCRIPT_DIR}/scripts/verify-staged-runtime.sh"

@@ -22,11 +22,35 @@ __pycache__/
 target/
 components/02-agent/target/
 
+# Payloads copied from the boot-animation, appearance, and agent-runtime repos.
+profile/airootfs/etc/plymouth/
+profile/airootfs/etc/dconf/db/local.d/00-02os
+profile/airootfs/etc/dconf/db/local.d/10-variant
+profile/airootfs/etc/dconf/db/gdm.d/
+profile/airootfs/etc/dconf/profile/
+profile/airootfs/etc/02os/
+profile/airootfs/etc/skel/.config/gtk-3.0/
+profile/airootfs/etc/skel/.config/gtk-4.0/
+profile/airootfs/etc/skel/.config/gnome-shell/
+profile/airootfs/usr/lib/tmpfiles.d/02os-zero-portal.conf
+profile/airootfs/usr/lib/systemd/user/02-agentd.service
+profile/airootfs/usr/share/plymouth/
+profile/airootfs/usr/share/gnome-shell/extensions/
+profile/airootfs/usr/share/glib-2.0/
+profile/airootfs/usr/share/gnome-control-center/
+profile/airootfs/usr/share/icons/02-OS/
+profile/airootfs/usr/share/icons/hicolor/scalable/apps/02os-logo.svg
+profile/airootfs/usr/share/pixmaps/02os-logo.svg
+profile/airootfs/usr/share/backgrounds/02os/
+profile/airootfs/usr/share/gnome-background-properties/02os.xml
+profile/airootfs/usr/share/02os/
+
 # Written by scripts/build-agent-runtime.sh and ./build.sh. Never commit them.
 profile/airootfs/usr/lib/02-agent/SOURCE_REVISION
 profile/airootfs/usr/lib/02-agent/BUILD_STAMP
 profile/airootfs/usr/bin/02
 profile/airootfs/usr/bin/02-agentd
 profile/airootfs/usr/bin/02agent
+profile/airootfs/usr/local/share/02os/browser-repo/
 
 

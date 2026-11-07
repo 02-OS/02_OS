@@ -19,7 +19,17 @@ fail() {
   exit 1
 }
 
-release="${repo_root}/components/02-agent/target/release"
+if [[ -n "${AGENT_RUNTIME_DIR:-}" && -d "${AGENT_RUNTIME_DIR}/target/release" ]]; then
+  release="${AGENT_RUNTIME_DIR}/target/release"
+elif [[ -d "${repo_root}/vendor/agent-runtime/target/release" ]]; then
+  release="${repo_root}/vendor/agent-runtime/target/release"
+elif [[ -d "${repo_root}/../agent-runtime/target/release" ]]; then
+  release="${repo_root}/../agent-runtime/target/release"
+elif [[ -d "${repo_root}/components/02-agent/target/release" ]]; then
+  release="${repo_root}/components/02-agent/target/release"
+else
+  release="${repo_root}/vendor/agent-runtime/target/release"
+fi
 staged="${repo_root}/profile/airootfs/usr/bin"
 prov="${repo_root}/profile/airootfs/usr/lib/02-agent/SOURCE_REVISION"
 

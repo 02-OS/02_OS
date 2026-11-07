@@ -1,0 +1,9 @@
+[submodule "vendor/boot-animation"]
+	path = vendor/boot-animation
+	url = ../boot-animation
+[submodule "vendor/appearance"]
+	path = vendor/appearance
+	url = ../appearance
+[submodule "vendor/agent-runtime"]
+	path = vendor/agent-runtime
+	url = ../agent-runtime

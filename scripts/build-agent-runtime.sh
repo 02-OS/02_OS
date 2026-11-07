@@ -7,7 +7,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-AGENT_DIR="${REPO_ROOT}/components/02-agent"
+# shellcheck source=resolve-components.sh
+source "${SCRIPT_DIR}/resolve-components.sh"
+AGENT_DIR="$(resolve_one AGENT_RUNTIME_DIR Cargo.toml vendor/agent-runtime agent-runtime)"
 DEST_DIR="${REPO_ROOT}/profile/airootfs/usr/bin"
 
 echo "=== [02 Agent Runtime] Compiling Release Binaries ==="
@@ -18,7 +20,6 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 1
 fi
 
-# Build release binaries in components/02-agent
 cargo build --release --manifest-path "${AGENT_DIR}/Cargo.toml"
 
 echo "=== [02 Agent Runtime] Running Verification Tests ==="
@@ -38,6 +39,10 @@ if command -v strip >/dev/null 2>&1; then
     echo "Stripping binaries..."
     strip "${DEST_DIR}/02" "${DEST_DIR}/02-agentd" || true
 fi
+
+unit_dest="${REPO_ROOT}/profile/airootfs/usr/lib/systemd/user/02-agentd.service"
+mkdir -p "$(dirname "${unit_dest}")"
+cp -a "${AGENT_DIR}/packaging/02-agentd.service" "${unit_dest}"
 
 PROV_DIR="${REPO_ROOT}/profile/airootfs/usr/lib/02-agent"
 mkdir -p "${PROV_DIR}"

@@ -1,7 +1,0 @@
-[org/gnome/login-screen]
-logo='/usr/share/pixmaps/02os-logo.svg'
-fallback-logo='/usr/share/pixmaps/02os-logo.svg'
-
-[org/gnome/shell]
-enabled-extensions=['02-zero-portal@02os']
-disable-user-extensions=false

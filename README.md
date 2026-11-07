@@ -73,9 +73,9 @@ Coding Agents (Codex / Claude / OpenCode)
 ```
 
 For complete documentation:
-- [User & CLI Reference](docs/agent-runtime.md)
-- [Architecture Specification](docs/agent-runtime-architecture.md)
-- [Security & Isolation Model](docs/agent-runtime-security.md)
+- [User & CLI Reference](vendor/agent-runtime/docs/agent-runtime.md)
+- [Architecture Specification](vendor/agent-runtime/docs/agent-runtime-architecture.md)
+- [Security & Isolation Model](vendor/agent-runtime/docs/agent-runtime-security.md)
 
 ---
 
@@ -101,7 +101,7 @@ autologin; new builds require sign-in after the boot animation.
 For disposable installed-OS VM tests, use the shared credentials documented in
 [VM testing](docs/VM_TESTING.md).
 
-See [Desktop motion](docs/desktop-motion.md) for settings, package versions and maintenance instructions.
+See [Desktop motion](vendor/appearance/docs/desktop-motion.md) for settings, package versions and maintenance instructions.
 These effects ship in new builds from this source. The previously tested
 `2026.10.01` ISO predates them; pushing source changes does not update an existing ISO.
 
@@ -136,46 +136,20 @@ These effects ship in new builds from this source. The previously tested
 ## Repository layout
 
 ```
-02_OS/
-├── README.md
-├── build.sh                   # Main ISO build orchestrator
-├── 02-OS-icons-preview.html   # Visual preview gallery for 02-OS icon pack
-├── components/
-│   └── 02-agent/              # 02 Agent Runtime (Rust Workspace)
-│       ├── Cargo.toml
-│       ├── crates/
-│       │   ├── agent-core/    # Identifiers, config, XDG paths, secrets
-│       │   ├── agent-git/     # libgit2 discovery, diff hunks, status
-│       │   ├── agent-parser/  # Tree-sitter AST symbol & reference graph
-│       │   ├── agent-index/   # SQLite WAL + FTS5 full-text indexing
-│       │   ├── agent-memory/  # Git-anchored memories & staleness engine
-│       │   ├── agent-context/ # Multi-signal context compiler & budgeter
-│       │   ├── agent-mcp/     # Model Context Protocol (2024-11-05) server
-│       │   ├── agent-daemon/  # 02-agentd systemd user daemon & watcher
-│       │   └── agent-cli/     # 02 CLI tool (alias 02agent)
-│       └── benchmarks/        # Automated performance benchmark suite
-├── docs/
-│   ├── agent-runtime.md       # User guide & command reference
-│   ├── agent-runtime-architecture.md # Architecture specification
-│   └── agent-runtime-security.md     # Security & threat model
-├── profile/
-│   ├── profiledef.sh          # ISO build configuration and file permissions
-│   ├── packages.x86_64        # Curated package manifest
-│   ├── pacman.conf
-│   └── airootfs/              # Live filesystem overlay:
-│       ├── etc/dconf/         # Desktop defaults and keybindings
-│       ├── etc/gdm/           # Native GNOME login screen; live autologin disabled
-│       ├── etc/skel/          # User default profile and GTK settings
-│       ├── etc/systemd/user/  # Enabled user services (02-agentd.service)
-│       ├── etc/sysusers.d/    # Declarative live user creation
-│       ├── root/              # Build-time customization script
-│       ├── usr/bin/           # Staged by ./build.sh from source; not committed
-│       ├── usr/lib/systemd/user/ # 02-agentd systemd service definition
-│       └── usr/share/icons/02-OS/ # Glassmorphic vector icon theme
-├── scripts/
-│   ├── build-agent-runtime.sh # Agent runtime build and staging script
-│   └── icon-generator/        # Python generator suite for the 02-OS icon pack
-└── out/                       # Generated ISO images
+02_OS/                         thin ISO orchestrator
+├── build.sh                   stages the three components, then runs mkarchiso
+├── profile/                   archiso profile; desktop and boot files are staged
+├── scripts/stage-components.sh
+├── scripts/build-agent-runtime.sh
+└── vendor/                    git submodules, when initialized
+    ├── boot-animation/
+    ├── appearance/
+    └── agent-runtime/
+
+Sibling checkouts used when the submodules are not initialized:
+../boot-animation/             Plymouth 02-zero-portal and the GDM handoff
+../appearance/                 glass base plus variants 01, 02, and 03
+../agent-runtime/              Rust workspace, CLI, daemon, and MCP server
 ```
 
 ---
@@ -185,10 +159,20 @@ These effects ship in new builds from this source. The previously tested
 `./build.sh` is the only supported way to build a 02_OS image. It compiles the agent runtime, checks that the staged `02` and `02-agentd` binaries match that build, and then runs the image build in Docker. The agent binaries are not in git. A manual `mkarchiso` of this profile is not a 02_OS image: the image build refuses agent binaries that were not just stamped by `./build.sh`.
 
 ```bash
-./build.sh
+git submodule update --init --recursive
+APPEARANCE_VARIANT=01 ./build.sh
 ```
 
+`APPEARANCE_VARIANT` is `01`, `02`, or `03`. When the submodules are not initialized, clone `boot-animation`, `appearance`, and `agent-runtime` next to this repo, or set `BOOT_ANIMATION_DIR`, `APPEARANCE_DIR`, and `AGENT_RUNTIME_DIR`.
+
 The ISO is written to `out/`.
+
+Agent tests, from the runtime repo:
+
+```bash
+cd ../agent-runtime
+cargo test --offline --workspace
+```
 
 ---
 

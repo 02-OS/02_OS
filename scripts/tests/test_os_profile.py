@@ -16,6 +16,17 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[2]
 OVERLAY = ROOT / "profile/airootfs"
+
+
+def appearance_root():
+    for candidate in (ROOT / "vendor/appearance", ROOT.parent / "appearance"):
+        if (candidate / "apply.sh").is_file():
+            return candidate
+    raise AssertionError("appearance repo not found next to 02_OS or at vendor/appearance")
+
+
+def setUpModule():
+    subprocess.run(["bash", str(ROOT / "scripts/stage-components.sh")], cwd=ROOT, check=True)
 EXTENSIONS = {
     "dash-to-dock@micxgx.gmail.com": "org.gnome.shell.extensions.dash-to-dock",
     "pop-shell@system76.com": "org.gnome.shell.extensions.pop-shell",
@@ -54,7 +65,7 @@ class OSProfileTests(unittest.TestCase):
         self.assertGreater(checked, 5)
 
     def test_python_generators_parse_without_execution(self):
-        scripts = sorted((ROOT / "scripts/icon-generator").glob("*.py"))
+        scripts = sorted((appearance_root() / "base/icon-generator").glob("*.py"))
         self.assertGreater(len(scripts), 0)
         for path in scripts:
             with self.subTest(path=path.name):
@@ -79,7 +90,7 @@ class OSProfileTests(unittest.TestCase):
                 self.checked("glib-compile-schemas", "--strict", "--dry-run", str(path))
 
     def test_motion_packages_and_defaults(self):
-        manifest = json.loads((ROOT / "docs/desktop-motion-vendor.json").read_text())
+        manifest = json.loads((appearance_root() / "docs/desktop-motion-vendor.json").read_text())
         for package in manifest["packages"]:
             ext = OVERLAY / "usr/share/gnome-shell/extensions" / package["uuid"]
             metadata = json.loads((ext / "metadata.json").read_text())
@@ -91,6 +102,10 @@ class OSProfileTests(unittest.TestCase):
                 self.assertRegex(package["sha256"], r"^[0-9a-f]{64}$")
                 for schema in (ext / "schemas").glob("*.gschema.xml"):
                     self.assertEqual(schema.read_bytes(), (OVERLAY / "usr/share/glib-2.0/schemas" / schema.name).read_bytes())
+
+        portal = json.loads((OVERLAY / "usr/share/gnome-shell/extensions/02-zero-portal@02os/metadata.json").read_text())
+        self.assertIn("51", portal["shell-version"])
+        self.assertEqual(portal["session-modes"], ["gdm"])
 
         defaults = configparser.ConfigParser(interpolation=None)
         defaults.read(OVERLAY / "etc/dconf/db/local.d/00-02os")
@@ -300,7 +315,7 @@ class OSProfileTests(unittest.TestCase):
         readme_lead = (ROOT / "README.md").read_text().splitlines()[2]
         self.assertIn("operating system", readme_lead)
         self.assertNotIn("Arch Linux", readme_lead)
-        self.assertNotIn("Arch Linux", (ROOT / "scripts/icon-generator/generate_html_gallery.py").read_text())
+        self.assertNotIn("Arch Linux", (appearance_root() / "base/icon-generator/generate_html_gallery.py").read_text())
 
     def test_customize_installs_identity_on_both_os_release_paths(self):
         script = (OVERLAY / "root/customize_airootfs.sh").read_text().splitlines()
@@ -434,7 +449,8 @@ class OSProfileTests(unittest.TestCase):
         text = unit.read_text()
         self.assertIn("ProtectHome=no", text)
         self.assertNotIn("ProtectHome=read-write", text)
-        self.assertIn("ReadWritePaths=-%h/.local/share/02-agent -%h/.cache/02-agent -%t", text)
+        self.assertIn("ProtectSystem=full", text)
+        self.assertNotIn("ReadWritePaths=", text)
         binary = "/usr/bin/systemd-analyze"
         self.assertTrue(Path(binary).is_file(), binary)
         result = subprocess.run([binary, "--user", "verify", str(unit)], capture_output=True, text=True, timeout=30)
