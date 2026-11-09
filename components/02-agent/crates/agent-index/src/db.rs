@@ -113,6 +113,12 @@ impl IndexDatabase {
                     supported: CURRENT_SCHEMA_VERSION,
                 });
             }
+            // schema_version is the authority. A current catalog must open
+            // without a write: rewriting user_version takes a lock and makes
+            // `02 symbol` fail while the daemon's index transaction is open.
+            if found == CURRENT_SCHEMA_VERSION {
+                return Ok(());
+            }
         }
         // SCHEMA_V5_SQL rebuilds `files` and is not safe to run twice.
         let apply_v5 = existing.map(|version| version < 5).unwrap_or(true);
