@@ -70,6 +70,14 @@ impl StoragePaths {
         Ok(dir.join("index.sqlite"))
     }
 
+    /// Git-anchored facts: ~/.local/share/02-agent/repos/<repo-id>/facts.sqlite
+    ///
+    /// `memories.jsonl` stays the evidence-memory record. Facts are a separate catalog.
+    pub fn repo_facts_path(repo_id: &RepoId) -> Result<PathBuf> {
+        let dir = Self::repo_dir(repo_id)?;
+        Ok(dir.join("facts.sqlite"))
+    }
+
     /// Memories path: ~/.local/share/02-agent/repos/<repo-id>/memories.jsonl
     pub fn repo_memories_path(repo_id: &RepoId) -> Result<PathBuf> {
         let dir = Self::repo_dir(repo_id)?;

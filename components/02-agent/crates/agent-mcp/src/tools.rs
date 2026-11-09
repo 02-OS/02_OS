@@ -197,6 +197,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             }),
         },
     ];
+    tools.extend(crate::nav_tools::definitions());
 
     for tool in &mut tools {
         if let Some(props) = tool
@@ -251,6 +252,11 @@ pub fn call_tool(repo_root: &Path, name: &str, arguments: &Value) -> ToolCallRes
 
     if matches!(name, "add" | "cognify" | "graph_export") {
         return crate::graph_tools::call(repo_root, name, arguments);
+    }
+    if let Some(result) = crate::nav_tools::call(
+        name, repo_root, &git_repo, &db, repo_id, &repo_info, arguments,
+    ) {
+        return result;
     }
 
     match name {

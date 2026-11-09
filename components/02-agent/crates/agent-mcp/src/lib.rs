@@ -1,5 +1,6 @@
 pub mod connect;
 pub mod graph_tools;
+pub mod nav_tools;
 pub mod protocol;
 pub mod server;
 pub mod tools;

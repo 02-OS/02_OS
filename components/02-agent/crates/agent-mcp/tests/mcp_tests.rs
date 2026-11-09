@@ -95,7 +95,10 @@ fn test_mcp_protocol_and_tools() {
         .as_array()
         .unwrap()
         .clone();
-    assert_eq!(tools.len(), 15);
+    assert!(tools.len() >= 40, "tool count {}", tools.len());
+    assert!(tools.iter().any(|tool| tool["name"] == "rank_files"));
+    assert!(tools.iter().any(|tool| tool["name"] == "fact_extract"));
+    assert!(tools.iter().any(|tool| tool["name"] == "run_tests"));
     assert!(tools.iter().any(|t| t["name"] == "repository_context"));
     assert!(tools.iter().any(|t| t["name"] == "repository_status"));
     assert!(tools.iter().any(|t| t["name"] == "add"));

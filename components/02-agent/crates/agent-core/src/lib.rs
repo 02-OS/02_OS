@@ -3,7 +3,10 @@ pub mod contain;
 pub mod error;
 pub mod graph_model;
 pub mod paths;
+pub mod routing;
 pub mod types;
+
+pub use routing::{Endpoint, ModelRouter, Route, TaskClass, TrustBoundary};
 
 pub use config::RepoConfig;
 pub use error::{AgentError, Result};

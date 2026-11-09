@@ -144,6 +144,7 @@ dependencies = [
  "git2",
  "hex",
  "libc",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
