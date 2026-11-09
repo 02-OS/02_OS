@@ -1,6 +1,6 @@
 use agent_core::{
-    paths::StoragePaths, AgentError, Dataset, EdgeKind, Ontology, Provenance, RepoConfig, RepoInfo,
-    Result, Session, SourceKind,
+    paths::StoragePaths, publish_index_phase, AgentError, Dataset, EdgeKind, Ontology, Provenance,
+    RepoConfig, RepoInfo, Result, Session, SourceKind,
 };
 use agent_git::GitRepo;
 use agent_index::{
@@ -86,7 +86,7 @@ impl RepoHandle {
         let root = info.root_path.clone();
         let config = RepoConfig::load_or_default(&root);
         let db_path = StoragePaths::repo_db_path(&info.id)?;
-        let mut db = IndexDatabase::open(&db_path)?;
+        let db = IndexDatabase::open(&db_path)?;
         db.note_repo_presence(&info)?;
         Ok(Self {
             root,
@@ -97,7 +97,7 @@ impl RepoHandle {
         })
     }
 
-    pub fn open_with_db(root: &Path, mut db: IndexDatabase) -> Result<Self> {
+    pub fn open_with_db(root: &Path, db: IndexDatabase) -> Result<Self> {
         let git = GitRepo::open(root)?;
         let info = git.info()?;
         let root = info.root_path.clone();
@@ -866,6 +866,7 @@ pub fn index_pipeline(
     let _index_lock = handle.db.lock_index()?;
     handle.info = handle.git.info()?;
     handle.db.invalidate_index(&handle.info.id)?;
+    let _ = publish_index_phase("indexing");
     let (mut report, fingerprint) = {
         let mut ctx = handle.context(
             None,
@@ -900,11 +901,13 @@ pub fn index_pipeline(
     )?);
     // If HEAD moved during this run, retain the catalog but never certify it.
     if handle.git.info()?.head_commit != info.head_commit {
+        let _ = publish_index_phase("stale");
         return Err(AgentError::General(
             "Repository HEAD changed during indexing; retry the index".into(),
         ));
     }
     handle.db.complete_index(&info, &fingerprint)?;
+    let _ = publish_index_phase("complete");
     Ok(report)
 }
 

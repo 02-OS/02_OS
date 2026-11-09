@@ -807,6 +807,9 @@ class OSProfileTests(unittest.TestCase):
         portal = source / "usr/share/gnome-shell/extensions/02-zero-portal@02os"
         portal.mkdir(parents=True)
         (portal / "extension.js").write_text("portal")
+        phase = source / "usr/share/gnome-shell/extensions/02-index-phase@02os"
+        phase.mkdir(parents=True)
+        (phase / "extension.js").write_text("phase")
         tmpfiles = source / "usr/lib/tmpfiles.d/02os-zero-portal.conf"
         tmpfiles.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(OVERLAY / "usr/lib/tmpfiles.d/02os-zero-portal.conf", tmpfiles)

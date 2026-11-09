@@ -26,6 +26,7 @@ pub struct IndexDatabase {
 pub struct CompletedIndexState {
     pub head_commit: Option<String>,
     pub fingerprint: String,
+    pub phase: String,
 }
 
 /// Serializes multi-transaction indexing pipelines, including separate processes.
@@ -288,12 +289,13 @@ impl IndexDatabase {
     pub fn completed_index(&self, repo_id: &RepoId) -> Result<Option<CompletedIndexState>> {
         self.conn
             .query_row(
-                "SELECT head_commit, fingerprint FROM completed_index_state WHERE repo_id = ?1",
+                "SELECT head_commit, fingerprint, phase FROM completed_index_state WHERE repo_id = ?1",
                 params![repo_id.as_str()],
                 |row| {
                     Ok(CompletedIndexState {
                         head_commit: row.get(0)?,
                         fingerprint: row.get(1)?,
+                        phase: row.get(2)?,
                     })
                 },
             )
@@ -303,9 +305,9 @@ impl IndexDatabase {
 
     pub fn complete_index(&mut self, info: &RepoInfo, fingerprint: &str) -> Result<()> {
         self.update_repo_info(info)?;
-        self.conn.execute("INSERT INTO completed_index_state (repo_id, head_commit, fingerprint, completed_at)
-            VALUES (?1, ?2, ?3, ?4) ON CONFLICT(repo_id) DO UPDATE SET
-            head_commit=excluded.head_commit, fingerprint=excluded.fingerprint, completed_at=excluded.completed_at",
+        self.conn.execute("INSERT INTO completed_index_state (repo_id, head_commit, fingerprint, completed_at, phase)
+            VALUES (?1, ?2, ?3, ?4, 'complete') ON CONFLICT(repo_id) DO UPDATE SET
+            head_commit=excluded.head_commit, fingerprint=excluded.fingerprint, completed_at=excluded.completed_at, phase='complete'",
             params![info.id.as_str(), info.head_commit, fingerprint, Utc::now().to_rfc3339()])
             .map_err(|e| AgentError::Database(format!("Complete index: {e}")))?;
         Ok(())
@@ -347,7 +349,7 @@ impl IndexDatabase {
     /// Inserts a new row with the given fields. On conflict, updates only name,
     /// root path, and branch. `head_commit` and `indexed_at` of an existing row
     /// stay at the last successful index.
-    pub fn note_repo_presence(&mut self, info: &RepoInfo) -> Result<()> {
+    pub fn note_repo_presence(&self, info: &RepoInfo) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         self.conn
             .execute(
@@ -617,8 +619,156 @@ impl IndexDatabase {
     }
 
     /// Execute FTS5 search query.
+    ///
+    /// With the `embeddings` feature, a local vector lookup may run first.
+    /// It returns nothing until a separate model process fills `file_vectors`,
+    /// and this method then uses FTS5.
     pub fn search_content(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        #[cfg(feature = "embeddings")]
+        if let Some(hits) = crate::embed::semantic_hits(&self.conn, query, limit)? {
+            if !hits.is_empty() {
+                return Ok(hits);
+            }
+        }
         FtsSearcher::search(&self.conn, query, limit)
+    }
+
+    /// The phase stored for a completed index. Missing rows are `idle`.
+    pub fn index_phase(&self, repo_id: &RepoId) -> Result<String> {
+        let stored = self
+            .completed_index(repo_id)?
+            .map(|state| state.phase)
+            .unwrap_or_default();
+        Ok(agent_core::phase_label(&stored).to_string())
+    }
+
+    /// Project one decayed fact. The id must already start with `fact:`.
+    pub fn project_fact_row(
+        &self,
+        repo_id: &RepoId,
+        memory_id: &str,
+        confidence: f64,
+        updated_at: &str,
+    ) -> Result<()> {
+        if !memory_id.starts_with("fact:") || memory_id == "fact:" {
+            return Err(AgentError::General(
+                "only fact projections may be written to memory_index".into(),
+            ));
+        }
+        if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+            return Err(AgentError::General(
+                "fact confidence is outside 0..=1".into(),
+            ));
+        }
+        self.conn
+            .execute(
+                "INSERT INTO memory_index (
+                    memory_id, repo_id, status, confidence, author_kind, updated_at, jsonl_offset
+                 ) VALUES (?1, ?2, 'projected', ?3, 'git-fact', ?4, NULL)
+                 ON CONFLICT(memory_id) DO UPDATE SET
+                    status = excluded.status,
+                    confidence = excluded.confidence,
+                    author_kind = excluded.author_kind,
+                    updated_at = excluded.updated_at",
+                params![memory_id, repo_id.as_str(), confidence, updated_at],
+            )
+            .map_err(|err| AgentError::Database(format!("fact projection failed: {err}")))?;
+        Ok(())
+    }
+
+    pub fn projected_confidence(&self, repo_id: &RepoId, memory_id: &str) -> Result<Option<f64>> {
+        self.conn
+            .query_row(
+                "SELECT confidence FROM memory_index WHERE repo_id = ?1 AND memory_id = ?2",
+                params![repo_id.as_str(), memory_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| AgentError::Database(format!("fact projection read failed: {err}")))
+    }
+
+    /// Store an approval after the self-approval gate. agt still checks the hash.
+    pub fn record_approval(
+        &self,
+        repo_id: &RepoId,
+        request: &crate::approval::ApprovalRequest,
+    ) -> Result<()> {
+        crate::approval::admit_approval(request)?;
+        self.conn
+            .execute(
+                "INSERT INTO approvals (
+                    id, repo_id, agt_run_id, agt_command_id, args_hash, decision, approver, source, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    request.id,
+                    repo_id.as_str(),
+                    request.agt_run_id,
+                    request.agt_command_id,
+                    request.args_hash.trim().to_ascii_lowercase(),
+                    request.decision,
+                    request.approver,
+                    request.source,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|err| AgentError::Database(format!("approval insert failed: {err}")))?;
+        Ok(())
+    }
+
+    /// Store an evidence package only when its digest and contract pass.
+    pub fn ingest_evidence(
+        &self,
+        repo_id: &RepoId,
+        package: &crate::evidence::EvidenceIngest,
+    ) -> Result<()> {
+        crate::evidence::admit_evidence(package)?;
+        let digest = crate::evidence::digest_package(&package.package_json);
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT package_digest FROM evidence_packages WHERE repo_id = ?1 AND agt_run_id = ?2",
+                params![repo_id.as_str(), package.agt_run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| AgentError::Database(format!("evidence lookup failed: {err}")))?;
+        if let Some(existing) = existing {
+            if existing.eq_ignore_ascii_case(&digest) {
+                return Ok(());
+            }
+            return Err(AgentError::Security(
+                "evidence run already has a different digest".into(),
+            ));
+        }
+        let id = crate::evidence::digest_package(&format!(
+            "{}:{}",
+            repo_id.as_str(),
+            package.agt_run_id
+        ));
+        self.conn
+            .execute(
+                "INSERT INTO evidence_packages (
+                    id, repo_id, agt_run_id, task_type, interaction, outcome,
+                    contract_digest, verification_digest, package_digest, package_json,
+                    head_commit, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    id,
+                    repo_id.as_str(),
+                    package.agt_run_id,
+                    package.task_type,
+                    package.interaction,
+                    package.outcome,
+                    package.contract_digest,
+                    package.verification_digest,
+                    digest,
+                    package.package_json,
+                    package.head_commit,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|err| AgentError::Database(format!("evidence insert failed: {err}")))?;
+        Ok(())
     }
 
     /// True when a catalog has files and the v5 full-text table has not been filled.

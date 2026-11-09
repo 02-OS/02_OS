@@ -201,6 +201,9 @@ class InstalledLauncherTests(unittest.TestCase):
         portal = source / "usr/share/gnome-shell/extensions/02-zero-portal@02os"
         portal.mkdir(parents=True)
         (portal / "extension.js").write_text("portal")
+        phase = source / "usr/share/gnome-shell/extensions/02-index-phase@02os"
+        phase.mkdir(parents=True)
+        (phase / "extension.js").write_text("phase")
         for rel, contents in {
             "usr/local/bin/02os-check-desktop": "#!/bin/sh\nexit 0\n",
             "usr/local/share/02os/desktop-compatibility.json": "{}\n",

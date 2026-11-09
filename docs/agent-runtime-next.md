@@ -37,11 +37,20 @@ This note describes the modules added beside the schema 5 catalog. `memories.jso
 
 `ModelRouter` names a Unix socket or a loopback HTTP port. The default route is absent. `https` hosts, non-loopback hosts, and relative sockets are rejected. This crate does not open the socket and does not load model weights. The model process stays outside the runtime.
 
-## Next modules
+## Ordering, projection, and the trust boundary
 
-1. Teach `compile` to order files with `rank` after a fixture locks the order the current tests expect.
-2. Write decayed fact rows into `memory_index` without making SQL the memory authority.
-3. Reject MCP self-approval. Keep `agt` as the process that checks an args hash.
-4. Ingest an agt evidence package only when the digest matches, and reject an empty contract or an applied ask.
-5. Show `completed_index_state.phase` on a GNOME Shell 51 session.
-6. Add an off-by-default embedding feature that still falls back to FTS5.
+`order_compiled_files` keeps the compile score as the first key. The fixture in `order.rs` locks that: a file scored 20 stays ahead of a file whose rank total is 100. Rank breaks ties, then the path does. `compile` calls it after `rank`.
+
+Decayed facts are copied into `memory_index` with ids prefixed by `fact:`. `jsonl_offset` stays null. `memories.jsonl` is still the evidence record.
+
+`admit_approval` rejects an invoker that is also the approver, and it rejects source `mcp`. A stored allow row has to come from `agt-cli`, `gnome`, or `02-cli` and carry a 64-character hex args hash. This runtime does not recompute that hash. The MCP server has no approve tool; a call named `approve` returns an error before it opens the repository.
+
+`ingest_evidence` stores a package only when `package_digest` is the SHA-256 of `package_json`, the contract digest is non-empty, and the outcome is not an applied ask. A second copy of the same digest is a no-op. A different digest for the same run is rejected.
+
+`02 index` publishes `idle`, `indexing`, `complete`, or `stale` to `~/.local/share/02-agent/index-phase`. The user-session extension `02-index-phase@02os` shows that line on GNOME Shell 51. It is separate from the login portal. A live Shell session was not started here.
+
+The `embeddings` feature is off by default. With the feature on, `semantic_hits` still returns nothing, including when `file_vectors` has rows, and `search_content` uses FTS5. No model weights are loaded.
+
+## Still open
+
+The foundation contract C1–C8 is not closed. In particular, this change does not pick the canonical line, replace the published ISO, or prove an agt process checked a live args hash. The next modules are a score-table fixture for the primary compile weights, writers that do not treat `memory_index` as memory, an agt ingest path outside this process, and a model process that can fill `file_vectors` without entering this binary.

@@ -3,6 +3,7 @@ pub mod contain;
 pub mod error;
 pub mod graph_model;
 pub mod paths;
+pub mod phase;
 pub mod routing;
 pub mod types;
 
@@ -15,6 +16,7 @@ pub use graph_model::{
     SourceKind,
 };
 pub use paths::StoragePaths;
+pub use phase::{phase_label, publish_index_phase, require_phase, write_index_phase};
 pub use types::{
     EvidenceItem, EvidenceMemory, FileKind, HostKind, IndexedFile, Language, LiveEnvironmentInfo,
     MemoryKind, MemoryStatus, ReferenceKind, RepoId, RepoInfo, SecretPattern, Symbol, SymbolKind,

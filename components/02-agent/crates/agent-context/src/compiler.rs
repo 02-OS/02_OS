@@ -1,5 +1,6 @@
 use crate::{
     budget::{estimate_tokens, BudgetManager},
+    order::order_compiled_files,
     ranking::TaskKeywords,
     score::{is_entry_path, score_file, ScoreBreakdown, ScoreInput},
     types::{
@@ -283,12 +284,17 @@ impl ContextCompiler {
             });
         }
 
-        // Sort files by score descending
+        // Sort by the locked compile score. Rank breaks ties, then the path.
         let mut sorted_files: Vec<(String, f64, Vec<String>)> = file_scores
             .into_iter()
             .map(|(path, (score, reasons))| (path, score, reasons))
             .collect();
-        sorted_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let rank_totals = Self::rank(root, task)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| (row.path, row.total))
+            .collect();
+        order_compiled_files(&mut sorted_files, &rank_totals);
 
         // Sort symbols by score descending
         candidate_symbols.sort_by(|a, b| {

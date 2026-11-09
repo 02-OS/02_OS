@@ -3,7 +3,9 @@ use agent_context::{allocate, estimate_tokens, BudgetItem, ContextCompiler};
 use agent_core::{ReferenceKind, RepoId, RepoInfo, SecretPattern};
 use agent_git::{discover_workspace, GitRepo};
 use agent_index::IndexDatabase;
-use agent_memory::{facts_from_hunks, facts_from_symbols, FactStore, DEFAULT_HALF_LIFE_DAYS};
+use agent_memory::{
+    facts_from_hunks, facts_from_symbols, project_facts, FactStore, DEFAULT_HALF_LIFE_DAYS,
+};
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -221,7 +223,7 @@ pub fn call(
         "workspace_search" => workspace_search(repo_root, arguments),
         "fact_extract" => fact_extract(git, db, repo_id, repo_info),
         "fact_list" => fact_list(repo_id),
-        "fact_decay" => fact_decay(repo_id, arguments),
+        "fact_decay" => fact_decay(db, repo_info, arguments),
         _ => return None,
     };
     Some(result)
@@ -741,6 +743,9 @@ fn fact_extract(
             return fail(err);
         }
     }
+    if let Err(err) = project_facts(db, repo_info, &facts) {
+        return fail(err);
+    }
     ok(json!({ "stored": facts.len(), "commit": commit }))
 }
 
@@ -774,7 +779,8 @@ fn fact_list(repo_id: &RepoId) -> ToolCallResult {
     }
 }
 
-fn fact_decay(repo_id: &RepoId, arguments: &Value) -> ToolCallResult {
+fn fact_decay(db: &IndexDatabase, repo_info: &RepoInfo, arguments: &Value) -> ToolCallResult {
+    let repo_id = &repo_info.id;
     let half_life = arguments
         .get("half_life_days")
         .and_then(|value| value.as_f64())
@@ -784,7 +790,17 @@ fn fact_decay(repo_id: &RepoId, arguments: &Value) -> ToolCallResult {
         Err(err) => return fail(err),
     };
     match store.decay(Utc::now(), half_life) {
-        Ok(changed) => ok(json!({ "updated": changed, "half_life_days": half_life })),
+        Ok(changed) => match store.list(repo_id.as_str()) {
+            Ok(facts) => match project_facts(db, repo_info, &facts) {
+                Ok(projected) => ok(json!({
+                    "updated": changed,
+                    "projected": projected,
+                    "half_life_days": half_life
+                })),
+                Err(err) => fail(err),
+            },
+            Err(err) => fail(err),
+        },
         Err(err) => fail(err),
     }
 }

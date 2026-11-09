@@ -219,6 +219,9 @@ pub fn list_tools() -> Vec<ToolDefinition> {
 }
 
 pub fn call_tool(repo_root: &Path, name: &str, arguments: &Value) -> ToolCallResult {
+    if matches!(name, "approve" | "approval" | "record_approval") {
+        return ToolCallResult::error("mcp client cannot approve its own call".to_string());
+    }
     let override_root = arguments
         .get("repo_path")
         .and_then(|v| v.as_str())
@@ -468,5 +471,19 @@ pub fn call_tool(repo_root: &Path, name: &str, arguments: &Value) -> ToolCallRes
         }
 
         unknown => ToolCallResult::error(format!("Unknown tool: '{}'", unknown)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::Path;
+
+    #[test]
+    fn mcp_cannot_approve_itself() {
+        let result = call_tool(Path::new("/tmp"), "approve", &json!({}));
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("cannot approve"));
     }
 }

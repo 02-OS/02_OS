@@ -22,7 +22,7 @@ fn run(json_output: bool, print_human: bool) -> Result<()> {
     let repo_dir = StoragePaths::repo_dir(&repo_info.id)?;
     let db_path = StoragePaths::repo_db_path(&repo_info.id)?;
 
-    let mut db = IndexDatabase::open(&db_path)?;
+    let db = IndexDatabase::open(&db_path)?;
     db.note_repo_presence(&repo_info)?;
 
     // Create .02agent/config.toml if not present
