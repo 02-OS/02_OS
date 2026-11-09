@@ -1,4 +1,4 @@
-use agent_core::types::{EvidenceItem, EvidenceMemory, MemoryKind, MemoryStatus, RepoId};
+use agent_core::types::{EvidenceItem, EvidenceMemory, MemoryKind, MemoryStatus, RepoId, RepoInfo};
 use agent_index::IndexDatabase;
 use agent_memory::{MemoryStore, MemoryVerifier};
 use chrono::Utc;
@@ -30,13 +30,24 @@ fn test_memory_store_crud() {
 
     store.save(&mem).unwrap();
 
+    let mut newer = mem.clone();
+    newer.claim = "A later writer stored this claim".to_string();
+    newer.updated_at = Utc::now();
+    store.save(&newer).unwrap();
+    let refused = store.save_if_unchanged(&mem, mem.updated_at).unwrap_err();
+    assert!(refused.to_string().contains("stale memory write"));
+    assert_eq!(
+        store.get("mem_auth_17").unwrap().unwrap().claim,
+        "A later writer stored this claim"
+    );
+
     let all = store.load_all().unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].id, "mem_auth_17");
 
     let found = store.get("mem_auth_17").unwrap();
     assert!(found.is_some());
-    assert_eq!(found.unwrap().claim, mem.claim);
+    assert_eq!(found.unwrap().claim, "A later writer stored this claim");
 
     let deleted = store.delete("mem_auth_17").unwrap();
     assert!(deleted);
@@ -177,4 +188,65 @@ fn memory_store_redacts_new_and_legacy_claims_without_changing_evidence() {
     store.save(&memory).unwrap();
     assert!(!fs::read_to_string(&path).unwrap().contains(&token));
     assert!(fs::read_to_string(&path).unwrap().contains("[REDACTED]"));
+}
+
+#[test]
+fn seed_names_02_os_and_uses_the_runtime_cargo_path_that_exists() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("profile")).unwrap();
+    fs::write(dir.path().join("profile/profiledef.sh"), "iso_name=02_OS\n").unwrap();
+    fs::create_dir_all(dir.path().join("vendor/agent-runtime")).unwrap();
+    fs::write(
+        dir.path().join("vendor/agent-runtime/Cargo.toml"),
+        "[workspace]\n",
+    )
+    .unwrap();
+
+    let store = MemoryStore::new(dir.path().join("memories.jsonl"));
+    let info = RepoInfo {
+        id: RepoId::from_path(dir.path()),
+        name: "fixture".to_string(),
+        root_path: dir.path().to_path_buf(),
+        head_commit: Some("abc123".to_string()),
+        branch: Some("master".to_string()),
+        is_clean: true,
+        modified_count: 0,
+        untracked_count: 0,
+    };
+    assert_eq!(store.seed_initial_if_empty(&info).unwrap(), 2);
+    let all = store.load_all().unwrap();
+    let profile = all
+        .iter()
+        .find(|memory| memory.id == "mem_archiso_profile")
+        .unwrap();
+    assert_eq!(
+        profile.claim,
+        "02_OS is a live image built with mkarchiso from profile/"
+    );
+    assert!(!profile.claim.contains("Arch Linux"));
+    let runtime = all
+        .iter()
+        .find(|memory| memory.id == "mem_agent_runtime")
+        .unwrap();
+    assert_eq!(runtime.evidence[0].file, "vendor/agent-runtime/Cargo.toml");
+
+    fs::create_dir_all(dir.path().join("components/02-agent")).unwrap();
+    fs::write(
+        dir.path().join("components/02-agent/Cargo.toml"),
+        "[workspace]\n",
+    )
+    .unwrap();
+    let preferred = MemoryStore::new(dir.path().join("other-memories.jsonl"));
+    preferred.seed_initial_if_empty(&info).unwrap();
+    let preferred_runtime = preferred
+        .load_all()
+        .unwrap()
+        .into_iter()
+        .find(|memory| memory.id == "mem_agent_runtime")
+        .unwrap();
+    assert_eq!(
+        preferred_runtime.evidence[0].file,
+        "components/02-agent/Cargo.toml"
+    );
+    assert!(preferred_runtime.claim.contains("components/02-agent/"));
 }

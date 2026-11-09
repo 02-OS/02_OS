@@ -63,6 +63,33 @@ impl MemoryStore {
         self.save_unlocked(memory)
     }
 
+    /// Replace `memory.id` only when its stored `updated_at` is still `seen`.
+    ///
+    /// A concurrent writer that stored a newer timestamp wins. This does not
+    /// resurrect a row the caller has not loaded.
+    pub fn save_if_unchanged(
+        &self,
+        memory: &EvidenceMemory,
+        seen_updated_at: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        let _lock = self.lock()?;
+        let mut memory = memory.clone();
+        memory.claim = SecretPattern::redact(&memory.claim);
+        let mut all = self.load_all()?;
+        if let Some(pos) = all.iter().position(|existing| existing.id == memory.id) {
+            if all[pos].updated_at != seen_updated_at {
+                return Err(AgentError::General(format!(
+                    "stale memory write for {} refused",
+                    memory.id
+                )));
+            }
+            all[pos] = memory;
+        } else {
+            all.push(memory);
+        }
+        self.write_all(&all)
+    }
+
     fn save_unlocked(&self, memory: &EvidenceMemory) -> Result<()> {
         let mut memory = memory.clone();
         memory.claim = SecretPattern::redact(&memory.claim);
@@ -141,9 +168,7 @@ impl MemoryStore {
         if profiledef.exists() {
             seeded.push(EvidenceMemory {
                 id: "mem_archiso_profile".to_string(),
-                claim:
-                    "02_OS is an Arch Linux live ISO distribution built via mkarchiso in profile/"
-                        .to_string(),
+                claim: "02_OS is a live image built with mkarchiso from profile/".to_string(),
                 kind: MemoryKind::ArchitecturalFact,
                 evidence: vec![EvidenceItem {
                     file: "profile/profiledef.sh".to_string(),
@@ -159,15 +184,25 @@ impl MemoryStore {
             });
         }
 
-        // 2. Check for Cargo workspace
-        let cargo_root = repo_info.root_path.join("components/02-agent/Cargo.toml");
-        if cargo_root.exists() {
+        // 2. Check for Cargo workspace. The split tree vendors the runtime.
+        let cargo_rel = [
+            "components/02-agent/Cargo.toml",
+            "vendor/agent-runtime/Cargo.toml",
+        ]
+        .into_iter()
+        .find(|rel| repo_info.root_path.join(rel).is_file());
+        if let Some(cargo_rel) = cargo_rel {
+            let cargo_dir = cargo_rel
+                .trim_end_matches("/Cargo.toml")
+                .trim_end_matches("Cargo.toml");
             seeded.push(EvidenceMemory {
                 id: "mem_agent_runtime".to_string(),
-                claim: "02 Agent Runtime is implemented as a modular Rust workspace in components/02-agent/ providing native Git & SQLite repository intelligence".to_string(),
+                claim: format!(
+                    "02 Agent Runtime is implemented as a modular Rust workspace in {cargo_dir}/ providing native Git & SQLite repository intelligence"
+                ),
                 kind: MemoryKind::ArchitecturalFact,
                 evidence: vec![EvidenceItem {
-                    file: "components/02-agent/Cargo.toml".to_string(),
+                    file: cargo_rel.to_string(),
                     symbols: vec!["agent-core".to_string(), "agent-index".to_string()],
                     commit: commit.clone(),
                     fingerprint: None,

@@ -1,6 +1,8 @@
 # 02 Agent Runtime roadmap: memory engine and decision sidecar
 
-Phases 2–5 are specified here and are not implemented yet. Phase 1 is the foundation that follows this document.
+`CURRENT_SCHEMA_VERSION` in `components/02-agent/crates/agent-index/src/schema.rs` is 5. `init_schema` applies the v1 catalog, the v2 dataset and graph tables, the v3 `source_symbol_id` column when it is missing, the v4 `completed_index_state` table, and v5 when the stored version is missing or below 5. v5 rebuilds `files` so the unique key is `(repo_id, relative_path)`, adds fingerprint columns, replaces `files_fts` (empty until the next index), and adds `actors`, `tool_invocations`, `approvals`, `evidence_packages`, and `memory_index`. A stored version newer than 5 is refused before any DDL. File and symbol rows are kept. Each repository has its own `index.sqlite`. Memories remain `memories.jsonl` beside it.
+
+Phases 2–5 in this document are not implemented. Phase 1, including schema versions 2 through 5, is already in the tree. Statements later in this file that say the schema is version 1 and never upgrades are superseded by this paragraph.
 
 The runtime is synchronous Rust, SQLite via `rusqlite` (WAL, `busy_timeout`, FTS5), XDG paths under `~/.local/share/02-agent/repos/<repo-id>/`, secrets filtered by `SecretPattern`, errors as `AgentError`. There is no async runtime and no network client. Those facts constrain every phase.
 
@@ -35,7 +37,7 @@ Nothing in the tree judges, gates, or records outcomes. The pieces to reuse late
 
 ## Schema today
 
-`agent-index` `CURRENT_SCHEMA_VERSION` is `1`. `init_schema` runs `CREATE TABLE IF NOT EXISTS` and inserts the version only when the table is empty. It never upgrades. Each repo has its own `index.sqlite` (so `files.relative_path UNIQUE` is per database, not global). Memories are `memories.jsonl` beside that file, not SQL.
+The running schema is version 5, as stated at the top of this document. `init_schema` upgrades a version 1, 2, 3, or 4 file in place. `PRAGMA user_version` is set to 5 as a mirror. The `schema_version` table is the authority. A newer `schema_version` is refused before DDL. Memories are `memories.jsonl` beside `index.sqlite`, not SQL rows. `memory_index` is created empty and is not written in this phase.
 
 Open path already sets `foreign_keys`, `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`.
 
@@ -62,7 +64,7 @@ Phase 3 adds workspace member `crates/agent-judge`. Phase 2 adds `EmbeddingProvi
 
 ## Schema version 2 (in place, no drops)
 
-Fresh databases create v1 and v2 tables and store version `2`. An existing version `1` file keeps every current row. Migration only adds tables and indexes, then sets `schema_version` to `2`.
+When this migration was added, fresh databases stored version 2. A current database stores version 5. The v2 statements still run because they are `CREATE TABLE IF NOT EXISTS`. An existing version `1` file keeps every current row. That step only adds tables and indexes.
 
 New tables, all keyed by `repo_id` with `ON DELETE CASCADE` from `repositories`:
 

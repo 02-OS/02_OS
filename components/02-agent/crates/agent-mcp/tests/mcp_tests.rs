@@ -1,8 +1,8 @@
 use agent_core::{
     config::RepoConfig,
-    types::{RepoId, RepoInfo},
+    types::{FileKind, IndexedFile, Language, RepoId, RepoInfo},
 };
-use agent_index::{IndexDatabase, RepoScanner};
+use agent_index::{IndexDatabase, RepoScanner, ScannedFile};
 use agent_mcp::{protocol::JsonRpcRequest, AgentConnector, AgentTarget, McpServer};
 use git2::Repository;
 use serde_json::json;
@@ -616,4 +616,113 @@ fn connect_refuses_symlinked_config_and_creates_new_configs_privately() {
         fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600
     );
+}
+
+#[test]
+fn repository_search_warns_when_the_full_text_index_is_empty() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let repo = Repository::init(root).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.rs"), "fn zebra_marker() {}\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("src/main.rs")).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Tester", "test@02os.org").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+
+    let repo_id = RepoId::from_path(root);
+    let db_path = agent_core::paths::StoragePaths::repo_db_path(&repo_id).unwrap();
+    let mut db = IndexDatabase::open(&db_path).unwrap();
+    db.update_repo_info(&RepoInfo {
+        id: repo_id.clone(),
+        name: "fts-unbuilt".into(),
+        root_path: root.to_path_buf(),
+        head_commit: None,
+        branch: Some("master".into()),
+        is_clean: true,
+        modified_count: 0,
+        untracked_count: 0,
+    })
+    .unwrap();
+    db.save_scanned_files(
+        &repo_id,
+        &[ScannedFile {
+            file: IndexedFile {
+                relative_path: "src/main.rs".into(),
+                file_hash: "abc".into(),
+                git_blob_id: None,
+                size_bytes: 4,
+                language: Language::Rust,
+                kind: FileKind::Source,
+                is_test: false,
+                is_doc: false,
+                indexed_at: chrono::Utc::now(),
+            },
+            absolute_path: root.join("src/main.rs"),
+            content: None,
+        }],
+    )
+    .unwrap();
+    drop(db);
+
+    let unbuilt = agent_mcp::call_tool(
+        root,
+        "repository_search",
+        &json!({ "query": "zebra", "limit": 5 }),
+    );
+    assert!(!unbuilt.is_error, "{unbuilt:?}");
+    let body: serde_json::Value = serde_json::from_str(&unbuilt.content[0].text).unwrap();
+    assert!(body.as_array().is_none(), "unbuilt search returned {body}");
+    assert_eq!(body["warnings"][0]["code"], "fts_unbuilt");
+    assert_eq!(body["hits"].as_array().unwrap().len(), 0);
+
+    let mut db = IndexDatabase::open(&db_path).unwrap();
+    db.save_scanned_files(
+        &repo_id,
+        &[ScannedFile {
+            file: IndexedFile {
+                relative_path: "src/main.rs".into(),
+                file_hash: "abc".into(),
+                git_blob_id: None,
+                size_bytes: 20,
+                language: Language::Rust,
+                kind: FileKind::Source,
+                is_test: false,
+                is_doc: false,
+                indexed_at: chrono::Utc::now(),
+            },
+            absolute_path: root.join("src/main.rs"),
+            content: Some("fn zebra_marker() {}\n".into()),
+        }],
+    )
+    .unwrap();
+    drop(db);
+
+    let built = agent_mcp::call_tool(
+        root,
+        "repository_search",
+        &json!({ "query": "zebra", "limit": 5 }),
+    );
+    assert!(!built.is_error, "{built:?}");
+    let hits: serde_json::Value = serde_json::from_str(&built.content[0].text).unwrap();
+    let Some(hits) = hits.as_array() else {
+        panic!("built search returned {hits}");
+    };
+    assert!(hits.iter().any(|hit| hit["relative_path"] == "src/main.rs"));
+
+    let _ = fs::remove_dir_all(db_path.parent().unwrap());
+}
+
+#[test]
+fn unknown_connect_target_writes_nothing() {
+    let home = tempdir().unwrap();
+    let err = AgentConnector::connect_at(home.path(), "not-a-client", true).unwrap_err();
+    assert!(err.to_string().contains("unsupported connect target"));
+    assert_eq!(fs::read_dir(home.path()).unwrap().count(), 0);
+    let preview = AgentConnector::connect_at(home.path(), "not-a-client", false).unwrap_err();
+    assert!(preview.to_string().contains("unsupported connect target"));
+    assert_eq!(fs::read_dir(home.path()).unwrap().count(), 0);
 }

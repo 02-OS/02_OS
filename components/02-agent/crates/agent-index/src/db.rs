@@ -1,5 +1,7 @@
 use crate::scanner::ScannedFile;
-use crate::schema::{CURRENT_SCHEMA_VERSION, SCHEMA_V1_SQL, SCHEMA_V2_SQL, SCHEMA_V4_SQL};
+use crate::schema::{
+    CURRENT_SCHEMA_VERSION, SCHEMA_V1_SQL, SCHEMA_V2_SQL, SCHEMA_V4_SQL, SCHEMA_V5_SQL,
+};
 use crate::search::{FtsSearcher, SearchResult};
 use agent_core::{
     error::AgentError,
@@ -102,6 +104,23 @@ impl IndexDatabase {
     }
 
     fn init_schema(&mut self) -> Result<()> {
+        let existing = stored_schema_version(&self.conn)?;
+        if let Some(found) = existing {
+            if found > CURRENT_SCHEMA_VERSION {
+                return Err(AgentError::SchemaVersion {
+                    found,
+                    supported: CURRENT_SCHEMA_VERSION,
+                });
+            }
+        }
+        // SCHEMA_V5_SQL rebuilds `files` and is not safe to run twice.
+        let apply_v5 = existing.map(|version| version < 5).unwrap_or(true);
+        let sidecar = if matches!(existing, Some(version) if version < 5) {
+            self.snapshot_pre_v5()?
+        } else {
+            None
+        };
+
         let tx = self
             .conn
             .transaction()
@@ -137,13 +156,13 @@ impl IndexDatabase {
         crate::graph::migrate_unscoped_commit_nodes(&tx)?;
         tx.execute_batch(SCHEMA_V4_SQL)
             .map_err(|e| AgentError::Database(format!("Schema v4 initialization failed: {e}")))?;
+        if apply_v5 {
+            tx.execute_batch(SCHEMA_V5_SQL).map_err(|e| {
+                AgentError::Database(format!("Schema v5 initialization failed: {e}"))
+            })?;
+        }
 
-        let version: Option<i32> = tx
-            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
-                r.get(0)
-            })
-            .ok();
-
+        let version = stored_schema_version(&tx)?;
         match version {
             None => {
                 tx.execute(
@@ -159,13 +178,74 @@ impl IndexDatabase {
                 )
                 .map_err(|e| AgentError::Database(format!("Version update failed: {}", e)))?;
             }
+            Some(found) if found > CURRENT_SCHEMA_VERSION => {
+                return Err(AgentError::SchemaVersion {
+                    found,
+                    supported: CURRENT_SCHEMA_VERSION,
+                });
+            }
             Some(_) => {}
         }
+
+        tx.execute_batch("PRAGMA user_version = 5;")
+            .map_err(|e| AgentError::Database(format!("user_version update failed: {e}")))?;
 
         tx.commit()
             .map_err(|e| AgentError::Database(format!("Failed to commit schema: {}", e)))?;
 
+        if apply_v5 {
+            let check: String = self
+                .conn
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .map_err(|e| AgentError::Database(format!("integrity_check failed: {e}")))?;
+            if check != "ok" {
+                return Err(AgentError::Database(format!(
+                    "integrity_check after schema v5 returned {check}"
+                )));
+            }
+            if let Some(path) = sidecar {
+                fs::remove_file(&path).map_err(|e| {
+                    AgentError::Database(format!("remove schema v5 snapshot failed: {e}"))
+                })?;
+            }
+        }
+
         Ok(())
+    }
+
+    /// Consistent copy of a catalog whose stored version is below 5.
+    /// An existing sidecar is left untouched. In-memory databases have no file to copy.
+    fn snapshot_pre_v5(&self) -> Result<Option<PathBuf>> {
+        let Some(db_path) = self
+            .conn
+            .path()
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+        else {
+            return Ok(None);
+        };
+        let sidecar = pre_v5_sidecar(&db_path);
+        if sidecar.symlink_metadata().is_ok() {
+            return Ok(None);
+        }
+        let text = sidecar.to_str().ok_or_else(|| {
+            AgentError::Database("schema v5 snapshot path is not UTF-8".to_string())
+        })?;
+        if text
+            .chars()
+            .any(|ch| matches!(ch, '\'' | '\n' | '\r' | '\0'))
+        {
+            return Err(AgentError::Database(
+                "schema v5 snapshot path contains a quote, newline, or NUL".to_string(),
+            ));
+        }
+        self.conn
+            .execute_batch(&format!("VACUUM INTO '{text}'"))
+            .map_err(|e| AgentError::Database(format!("schema v5 snapshot failed: {e}")))?;
+        let mut permissions = fs::metadata(&sidecar)?.permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&sidecar, permissions)?;
+        Ok(Some(sidecar))
     }
 
     pub fn schema_version(&self) -> Result<i32> {
@@ -312,8 +392,11 @@ impl IndexDatabase {
             params![repo_id.as_str()],
         )
         .map_err(|e| AgentError::Database(format!("Failed to clear old files: {}", e)))?;
-        tx.execute("DELETE FROM files_fts", [])
-            .map_err(|e| AgentError::Database(format!("Failed to clear FTS index: {}", e)))?;
+        tx.execute(
+            "DELETE FROM files_fts WHERE repo_id = ?1",
+            params![repo_id.as_str()],
+        )
+        .map_err(|e| AgentError::Database(format!("Failed to clear FTS index: {}", e)))?;
 
         let mut count = 0;
         {
@@ -331,8 +414,8 @@ impl IndexDatabase {
             let mut insert_fts = tx
                 .prepare(
                     r#"
-                    INSERT INTO files_fts (relative_path, content)
-                    VALUES (?1, ?2)
+                    INSERT INTO files_fts (repo_id, relative_path, content)
+                    VALUES (?1, ?2, ?3)
                     "#,
                 )
                 .map_err(|e| AgentError::Database(format!("Prepare insert FTS failed: {}", e)))?;
@@ -359,7 +442,7 @@ impl IndexDatabase {
                 // Add to FTS5 if content is present
                 if let Some(ref text) = item.content {
                     insert_fts
-                        .execute(params![f.relative_path, text])
+                        .execute(params![repo_id.as_str(), f.relative_path, text])
                         .map_err(|e| AgentError::Database(format!("Insert FTS error: {}", e)))?;
                 }
 
@@ -536,6 +619,19 @@ impl IndexDatabase {
     /// Execute FTS5 search query.
     pub fn search_content(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
         FtsSearcher::search(&self.conn, query, limit)
+    }
+
+    /// True when a catalog has files and the v5 full-text table has not been filled.
+    pub fn fts_needs_rebuild(&self) -> Result<bool> {
+        let files: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .map_err(|e| AgentError::Database(format!("files count failed: {e}")))?;
+        let indexed: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM files_fts", [], |row| row.get(0))
+            .map_err(|e| AgentError::Database(format!("files_fts count failed: {e}")))?;
+        Ok(files > 0 && indexed == 0)
     }
 
     /// Save extracted symbols and directed reference edges.
@@ -1004,8 +1100,8 @@ impl IndexDatabase {
             .map_err(|e| AgentError::Database(format!("Delete file error: {}", e)))?;
 
             tx.execute(
-                "DELETE FROM files_fts WHERE relative_path = ?1",
-                params![path],
+                "DELETE FROM files_fts WHERE repo_id = ?1 AND relative_path = ?2",
+                params![repo_id.as_str(), path],
             )
             .map_err(|e| AgentError::Database(format!("Delete FTS error: {}", e)))?;
 
@@ -1040,8 +1136,8 @@ impl IndexDatabase {
             .map_err(|e| AgentError::Database(format!("Clear old refs error: {}", e)))?;
 
             tx.execute(
-                "DELETE FROM files_fts WHERE relative_path = ?1",
-                params![path],
+                "DELETE FROM files_fts WHERE repo_id = ?1 AND relative_path = ?2",
+                params![repo_id.as_str(), path],
             )
             .map_err(|e| AgentError::Database(format!("Clear old FTS error: {}", e)))?;
 
@@ -1054,7 +1150,7 @@ impl IndexDatabase {
                     repo_id, relative_path, file_hash, git_blob_id, size_bytes,
                     language, kind, is_test, is_doc, indexed_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                ON CONFLICT(relative_path) DO UPDATE SET
+                ON CONFLICT(repo_id, relative_path) DO UPDATE SET
                     file_hash = excluded.file_hash,
                     git_blob_id = excluded.git_blob_id,
                     size_bytes = excluded.size_bytes,
@@ -1081,8 +1177,8 @@ impl IndexDatabase {
 
             if let Some(ref text) = item.content {
                 tx.execute(
-                    "INSERT INTO files_fts (relative_path, content) VALUES (?1, ?2)",
-                    params![f.relative_path, text],
+                    "INSERT INTO files_fts (repo_id, relative_path, content) VALUES (?1, ?2, ?3)",
+                    params![repo_id.as_str(), f.relative_path, text],
                 )
                 .map_err(|e| AgentError::Database(format!("Insert FTS error: {}", e)))?;
             }
@@ -1163,6 +1259,40 @@ impl IndexDatabase {
 
         Ok((files_updated, sym_count, files_deleted))
     }
+}
+
+fn stored_schema_version(conn: &Connection) -> Result<Option<i32>> {
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| AgentError::Database(format!("schema version lookup failed: {e}")))?;
+    if exists == 0 {
+        return Ok(None);
+    }
+    match conn.query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
+        row.get(0)
+    }) {
+        Ok(version) => Ok(Some(version)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(AgentError::Database(format!(
+            "schema version read failed: {e}"
+        ))),
+    }
+}
+
+fn pre_v5_sidecar(db_path: &Path) -> PathBuf {
+    let name = db_path
+        .file_name()
+        .map(|name| {
+            let mut next = name.to_os_string();
+            next.push(".pre-v5");
+            next
+        })
+        .unwrap_or_else(|| std::ffi::OsString::from(".pre-v5"));
+    db_path.with_file_name(name)
 }
 
 fn restrict_sqlite_files(path: &Path) {

@@ -1,4 +1,6 @@
-use agent_core::{Language, LiveEnvironmentInfo, RepoConfig, RepoId, SecretPattern, StoragePaths};
+use agent_core::{
+    HostKind, Language, LiveEnvironmentInfo, RepoConfig, RepoId, SecretPattern, StoragePaths,
+};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tempfile::tempdir;
@@ -48,6 +50,36 @@ fn test_secret_detection() {
     let redacted = SecretPattern::redact(&format!("prefix {token} suffix"));
     assert!(!redacted.contains(&token));
     assert!(redacted.contains("[REDACTED]"));
+
+    let aws = format!("aws_secret_access_key = \"{}\"", "A".repeat(40));
+    let aws_redacted = SecretPattern::redact(&aws);
+    assert!(!aws_redacted.contains(&"A".repeat(40)));
+    assert!(aws_redacted.contains("[REDACTED]"));
+    let bare_hex = "a".repeat(40);
+    assert!(SecretPattern::redact(&bare_hex).contains(&bare_hex));
+}
+
+#[test]
+fn test_host_kind_uses_live_markers_and_os_release_name() {
+    assert_eq!(
+        HostKind::classify(true, "NAME=\"Arch Linux\"\n"),
+        HostKind::Live
+    );
+    assert_eq!(
+        HostKind::classify(false, "NAME=\"02_OS\"\nID=02os\n"),
+        HostKind::Installed
+    );
+    assert_eq!(
+        HostKind::classify(false, "NAME=02_OS\n"),
+        HostKind::Installed
+    );
+    assert_eq!(
+        HostKind::classify(false, "NAME=\"Arch Linux\"\nID=arch\n"),
+        HostKind::Unidentified
+    );
+    assert_eq!(HostKind::classify(false, ""), HostKind::Unidentified);
+    assert_eq!(HostKind::Unidentified.label(), "Unidentified host");
+    assert_eq!(HostKind::Installed.label(), "02_OS Installed System");
 }
 
 #[test]

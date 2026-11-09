@@ -425,3 +425,87 @@ fn context_redacts_commit_summaries() {
     assert!(estimate_tokens(&payload) <= 8000);
     assert_eq!(package.budget.returned_tokens, estimate_tokens(&payload));
 }
+
+#[test]
+fn secret_named_dirty_file_is_omitted_from_context() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let repo = Repository::init(root).unwrap();
+    let sig = git2::Signature::now("Engineer", "dev@02os.org").unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn rotate_refresh_token() {}\n",
+    )
+    .unwrap();
+    let sentinel = "SENTINEL_SECRET_VALUE_92f3";
+    fs::write(
+        root.join("secrets.json"),
+        format!("{{\"token\":\"{sentinel}\"}}\n"),
+    )
+    .unwrap();
+    let mut index = repo.index().unwrap();
+    index
+        .add_all(["*"].iter(), git2::IndexAddOption::FORCE, None)
+        .unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+        .unwrap();
+
+    let repo_id = RepoId::from_path(root);
+    let mut db =
+        IndexDatabase::open(agent_core::paths::StoragePaths::repo_db_path(&repo_id).unwrap())
+            .unwrap();
+    db.update_repo_info(&RepoInfo {
+        id: repo_id.clone(),
+        name: "secret-context".into(),
+        root_path: root.to_path_buf(),
+        head_commit: Some("abc".into()),
+        branch: Some("master".into()),
+        is_clean: false,
+        modified_count: 1,
+        untracked_count: 0,
+    })
+    .unwrap();
+    let scanned = RepoScanner::new(root, RepoConfig::default()).scan();
+    db.save_scanned_files(&repo_id, &scanned).unwrap();
+    db.complete_index(
+        &RepoInfo {
+            id: repo_id,
+            name: "secret-context".into(),
+            root_path: root.to_path_buf(),
+            head_commit: Some("abc".into()),
+            branch: Some("master".into()),
+            is_clean: false,
+            modified_count: 1,
+            untracked_count: 0,
+        },
+        &RepoScanner::scan_fingerprint(&scanned, &RepoConfig::default()),
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("secrets.json"),
+        format!("{{\"token\":\"{sentinel}-dirty\"}}\n"),
+    )
+    .unwrap();
+
+    let package = ContextCompiler::compile(root, "rotate_refresh_token", 4000).unwrap();
+    let payload = package.serialized_payload();
+    assert!(!payload.contains(sentinel));
+    assert!(!payload.contains("secrets.json"));
+    assert!(package
+        .relevant_files
+        .iter()
+        .all(|file| file.relative_path != "secrets.json"));
+    assert!(!package
+        .git_context
+        .modified_files
+        .iter()
+        .any(|path| path == "secrets.json"));
+    assert!(package
+        .relevant_files
+        .iter()
+        .any(|file| file.relative_path == "src/lib.rs"));
+}

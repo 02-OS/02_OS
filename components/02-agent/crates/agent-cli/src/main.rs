@@ -221,7 +221,11 @@ fn main() -> ExitCode {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("Error: {}", e);
-            ExitCode::FAILURE
+            if e.to_string().contains("unsupported connect target") {
+                ExitCode::from(2)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }

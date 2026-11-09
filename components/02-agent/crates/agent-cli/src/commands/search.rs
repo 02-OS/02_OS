@@ -17,15 +17,25 @@ pub fn execute(query: &str, limit: usize, json_output: bool) -> Result<()> {
 
     let db = IndexDatabase::open(&db_path)?;
     let results = db.search_content(query, limit)?;
+    let unbuilt = db.fts_needs_rebuild()?;
 
     if json_output {
-        let out = json!({
+        let mut out = json!({
             "query": query,
             "count": results.len(),
             "results": results,
         });
+        if unbuilt {
+            out["warnings"] = json!([{
+                "code": "fts_unbuilt",
+                "message": "full-text index is empty; run 02 index"
+            }]);
+        }
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
+        if unbuilt {
+            println!("full-text index is empty; run 02 index");
+        }
         println!("Search Results for: \"{}\"", query);
         if results.is_empty() {
             println!("  No matching files or symbols found.");

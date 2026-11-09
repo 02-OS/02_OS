@@ -521,6 +521,8 @@ fn secret_patterns() -> &'static [regex::Regex] {
         [
             r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
             r"\bAKIA[0-9A-Z]{16}\b",
+            // Named AWS secret access keys only. A bare 40-character hex blob stays visible.
+            r#"(?i)aws_secret_access_key\s*[=:]\s*["']?[A-Za-z0-9/+=]{40}"#,
             r"\bghp_[A-Za-z0-9_]{36}\b",
             r"\bgithub_pat_[A-Za-z0-9_]{82}\b",
             r"\bxox[baprs]-[0-9A-Za-z-]{10,48}",
@@ -532,11 +534,73 @@ fn secret_patterns() -> &'static [regex::Regex] {
     })
 }
 
+/// How this machine relates to 02_OS. The account name `live` is not an input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostKind {
+    /// `/run/archiso/bootmnt` or `/run/archiso/airootfs` is present.
+    Live,
+    /// Not a live image, and os-release `NAME` is `02_OS`.
+    Installed,
+    /// Neither live markers nor an installed 02_OS identity.
+    Unidentified,
+}
+
+impl HostKind {
+    /// Classify from live-image markers and the text of an os-release file.
+    pub fn classify(live_markers: bool, os_release: &str) -> Self {
+        if live_markers {
+            return Self::Live;
+        }
+        if os_release_names_product(os_release) {
+            Self::Installed
+        } else {
+            Self::Unidentified
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Live => "02_OS Live ISO",
+            Self::Installed => "02_OS Installed System",
+            Self::Unidentified => "Unidentified host",
+        }
+    }
+}
+
+fn os_release_names_product(text: &str) -> bool {
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "NAME" {
+            continue;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|rest| rest.strip_suffix('\''))
+            })
+            .unwrap_or(value);
+        return value == "02_OS";
+    }
+    false
+}
+
 /// Live ISO runtime detection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveEnvironmentInfo {
     pub is_live: bool,
     pub live_overlay_detected: bool,
+    pub host_kind: HostKind,
     pub details: String,
 }
 
@@ -547,17 +611,33 @@ impl LiveEnvironmentInfo {
         // The account name `live` is not evidence of the live image. sudo keeps
         // the caller's USER, and an installed account can also be named live.
         let is_live = has_bootmnt || has_archiso_airootfs;
+        let os_release = read_os_release();
+        let host_kind = HostKind::classify(is_live, &os_release);
 
-        let details = if is_live {
-            "Running inside 02_OS Live ISO session. Repository indices created in home directory are stored in volatile RAM overlayfs unless mounted from persistent media.".to_string()
-        } else {
-            "Running on installed 02_OS system with persistent storage.".to_string()
+        let details = match host_kind {
+            HostKind::Live => "Running inside 02_OS Live ISO session. Repository indices created in home directory are stored in volatile RAM overlayfs unless mounted from persistent media.".to_string(),
+            HostKind::Installed => {
+                "Running on installed 02_OS system with persistent storage.".to_string()
+            }
+            HostKind::Unidentified => {
+                "Host is not the 02_OS live image and os-release NAME is not 02_OS.".to_string()
+            }
         };
 
         Self {
             is_live,
             live_overlay_detected: has_bootmnt || has_archiso_airootfs,
+            host_kind,
             details,
         }
     }
+}
+
+fn read_os_release() -> String {
+    for path in ["/etc/os-release", "/usr/lib/os-release"] {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            return text;
+        }
+    }
+    String::new()
 }

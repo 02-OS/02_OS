@@ -13,7 +13,7 @@ pub use graph_model::{
 };
 pub use paths::StoragePaths;
 pub use types::{
-    EvidenceItem, EvidenceMemory, FileKind, IndexedFile, Language, LiveEnvironmentInfo, MemoryKind,
-    MemoryStatus, ReferenceKind, RepoId, RepoInfo, SecretPattern, Symbol, SymbolKind,
+    EvidenceItem, EvidenceMemory, FileKind, HostKind, IndexedFile, Language, LiveEnvironmentInfo,
+    MemoryKind, MemoryStatus, ReferenceKind, RepoId, RepoInfo, SecretPattern, Symbol, SymbolKind,
     SymbolReference,
 };

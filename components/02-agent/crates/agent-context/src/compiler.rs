@@ -50,6 +50,11 @@ impl ContextCompiler {
 
         // 1. Git staleness & diff detection
         let diff_files = git_repo.get_diff_files()?;
+        let scored_diffs: Vec<String> = diff_files
+            .iter()
+            .filter(|path| !SecretPattern::is_secret(Path::new(path.as_str())))
+            .cloned()
+            .collect();
         StalenessEngine::evaluate(root, repo_id, &git_repo, &db, &store)?;
 
         let head_commit_str = repo_info
@@ -89,8 +94,8 @@ impl ContextCompiler {
         let mut seen_symbols: HashSet<String> = HashSet::new();
 
         // Signal A: Working tree diff
-        let diff_set: HashSet<&str> = diff_files.iter().map(|s| s.as_str()).collect();
-        for df in &diff_files {
+        let diff_set: HashSet<&str> = scored_diffs.iter().map(|s| s.as_str()).collect();
+        for df in &scored_diffs {
             let entry = file_scores.entry(df.clone()).or_insert((0.0, Vec::new()));
             entry.0 += 8.0;
             entry.1.push("modified in working tree".to_string());
@@ -111,6 +116,9 @@ impl ContextCompiler {
             }
 
             for (sym, base_score, reason) in matched_syms {
+                if SecretPattern::is_secret(Path::new(&sym.file_path)) {
+                    continue;
+                }
                 let mut sym_score = base_score;
                 let mut reasons = vec![reason];
 
@@ -376,7 +384,7 @@ impl ContextCompiler {
         let git_summary = GitContextSummary {
             head_commit: repo_info.head_commit,
             branch: repo_info.branch,
-            modified_files: diff_files,
+            modified_files: scored_diffs,
             recent_commits: relevant_commits,
         };
 

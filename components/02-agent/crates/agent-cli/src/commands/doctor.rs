@@ -96,14 +96,7 @@ pub fn execute(json_output: bool) -> Result<()> {
                 "No [FAILED]"
             }
         );
-        println!(
-            "  • Distribution:     {}",
-            if live_env.is_live {
-                "02_OS Live ISO"
-            } else {
-                "02_OS Installed System"
-            }
-        );
+        println!("  • Distribution:     {}", live_env.host_kind.label());
         if live_env.is_live {
             println!("    [Notice]          {}", live_env.details);
         }

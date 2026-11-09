@@ -20,10 +20,11 @@ impl FtsSearcher {
             return Ok(Vec::new());
         }
 
+        // files_fts columns are repo_id, relative_path, content. Snippet column 2 is content.
         let sql = r#"
             SELECT 
                 relative_path, 
-                snippet(files_fts, 1, '<b>', '</b>', '...', 16) AS snippet,
+                snippet(files_fts, 2, '<b>', '</b>', '...', 16) AS snippet,
                 bm25(files_fts) AS rank
             FROM files_fts
             WHERE files_fts MATCH ?1

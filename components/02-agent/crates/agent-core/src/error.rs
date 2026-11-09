@@ -22,6 +22,9 @@ pub enum AgentError {
     #[error("Database error: {0}")]
     Database(String),
 
+    #[error("schema version {found} is not writable by this binary ({supported})")]
+    SchemaVersion { found: i32, supported: i32 },
+
     #[error("Repository not found: {0}")]
     RepositoryNotFound(String),
 

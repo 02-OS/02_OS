@@ -208,6 +208,7 @@ impl StalenessEngine {
             }
 
             let old_status = mem.status;
+            let seen_updated_at = mem.updated_at;
             if has_stale_evidence {
                 mem.status = MemoryStatus::Stale;
                 mem.confidence = 0.0;
@@ -222,7 +223,7 @@ impl StalenessEngine {
                     mem.confidence = 0.70;
                 }
             } else {
-                // No changed symbols touching this memory -> preserve fresh status!
+                // Status follows the evidence snapshot. The changed-symbol set is report-only.
                 mem.status = MemoryStatus::Fresh;
                 mem.confidence = 1.0;
             }
@@ -240,7 +241,7 @@ impl StalenessEngine {
             }
 
             if memory_changed {
-                store.save(&mem)?;
+                store.save_if_unchanged(&mem, seen_updated_at)?;
             }
         }
 

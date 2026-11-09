@@ -146,6 +146,11 @@ impl AgentConnector {
         write_to_file: bool,
     ) -> Result<String> {
         let target = AgentTarget::parse(target_name);
+        if matches!(target, AgentTarget::Generic) {
+            return Err(AgentError::Config(format!(
+                "unsupported connect target '{target_name}'"
+            )));
+        }
         // GUI clients may have no shell PATH. Persist the executable that
         // actually ran this command; printed snippets remain portable.
         let executable = if write_to_file {

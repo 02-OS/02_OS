@@ -283,9 +283,21 @@ pub fn call_tool(repo_root: &Path, name: &str, arguments: &Value) -> ToolCallRes
         "repository_search" => {
             let query = arguments["query"].as_str().unwrap_or("");
             let limit = arguments["limit"].as_u64().unwrap_or(10) as usize;
-
-            match db.search_content(query, limit) {
-                Ok(results) => ToolCallResult::text(json!(results).to_string()),
+            match db.fts_needs_rebuild() {
+                Ok(true) => {
+                    let res = json!({
+                        "hits": [],
+                        "warnings": [{
+                            "code": "fts_unbuilt",
+                            "message": "full-text index is empty; run 02 index"
+                        }]
+                    });
+                    ToolCallResult::text(res.to_string())
+                }
+                Ok(false) => match db.search_content(query, limit) {
+                    Ok(results) => ToolCallResult::text(json!(results).to_string()),
+                    Err(e) => ToolCallResult::error(format!("Search error: {}", e)),
+                },
                 Err(e) => ToolCallResult::error(format!("Search error: {}", e)),
             }
         }

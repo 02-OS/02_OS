@@ -134,15 +134,17 @@ components/02-agent/
 
 ### 2.6 `agent-context`
 - **Task Intent Parsing**: Extracts identifiers, keywords, file paths, and operations from natural language prompts.
-- **Multi-Signal Relevance Scoring**:
-  1. Exact symbol name match (Score: +10.0)
-  2. Modified in working tree / git diff (Score: +8.0)
-  3. Partial / case-insensitive symbol match (Score: +5.0)
-  4. Related test suites (Score: +4.5)
-  5. Dependency / call-graph proximity (Score: +3.0)
-  6. BM25 full-text search score (Normalized 0.0 - 5.0)
-  7. Fresh architectural memories (Score: +2.5)
-  8. Recent commit activity (Score: +1.5)
+- **Multi-Signal Relevance Scoring** (these are the weights in `compiler.rs`):
+  1. Exact symbol name match: +10 on the symbol and on its file.
+  2. Partial symbol match (`search_symbols`, limit 25): +7.
+  3. Dirty working-tree path: +8 on the file, and +8 again on a symbol in that file. Secret-named paths are left out of this score and out of the published path list.
+  4. Caller file: +5.
+  5. Callee file: +4.
+  6. Test file and the scored test: +6.
+  7. Full-text rank boost: `6.0 - min(4.0, rank_index * 0.3)`, so 6.0 down to 2.0. This is the hit's position, not the SQLite `bm25()` value.
+  8. A fresh memory whose claim or evidence symbol matches: +4 on each evidence file that passes validation. The memory item itself receives no score.
+  9. The last 15 commits are copied, with author and summary redacted. They receive no score, and the copy is not filtered to files already selected.
+- **Token estimate**: UTF-8 byte length divided by 4, rounding up (`text.len().div_ceil(4)`). The reported `returned_tokens` is that estimate of the pretty-printed redacted JSON, repeated until the digits of the count stop changing the size. Hard caps before that prune are 15 files, 12 symbols, 10 dependency edges, and 8 tests.
 - **Token Budget Allocator**: Ranked evidence selection followed by bounded pruning against the final redacted JSON payload (default 8,000 estimated tokens).
 - **Dual Format Output**: Emits structured JSON (`--json`) or human/agent-readable Markdown.
 
@@ -176,7 +178,7 @@ components/02-agent/
 
 ## 3. SQLite Storage Schema
 
-All index metadata is stored in `~/.local/share/02-agent/repos/<repo-id>/index.sqlite`. The database is schema version 4. Existing v1/v2/v3 catalogs upgrade in place; references without caller IDs are re-extracted on the next index or cognify run. Legacy catalogs have no completed-index marker until their next successful index. Observing a repository updates its identity without certifying its content. The statements below match `components/02-agent/crates/agent-index/src/schema.rs`.
+All index metadata is stored in `~/.local/share/02-agent/repos/<repo-id>/index.sqlite`. The database is schema version 5. Existing v1 through v4 catalogs upgrade in place. The `files` unique key is `(repo_id, relative_path)`. `files.raw_fingerprint` and `files.redacted_fingerprint` are present and left null by the upgrade. `symbols.redacted_fingerprint` is copied from `fingerprint`. `completed_index_state.phase` defaults to `complete`. The full-text table is recreated empty until the next index. `actors`, `tool_invocations`, `approvals`, `evidence_packages`, and `memory_index` are created by `SCHEMA_V5_SQL` in `components/02-agent/crates/agent-index/src/schema.rs`. References without caller IDs are re-extracted on the next index or cognify run. Legacy catalogs have no completed-index marker until their next successful index. Observing a repository updates its identity without certifying its content. The statements below are the catalog tables after that upgrade. They are not the full migration script.
 
 ```sql
 CREATE TABLE IF NOT EXISTS completed_index_state (
@@ -184,13 +186,14 @@ CREATE TABLE IF NOT EXISTS completed_index_state (
     head_commit TEXT,
     fingerprint TEXT NOT NULL,
     completed_at TEXT NOT NULL,
+    phase TEXT NOT NULL DEFAULT 'complete',
     FOREIGN KEY(repo_id) REFERENCES repositories(repo_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     repo_id TEXT NOT NULL,
-    relative_path TEXT NOT NULL UNIQUE,
+    relative_path TEXT NOT NULL,
     file_hash TEXT NOT NULL,
     git_blob_id TEXT,
     size_bytes INTEGER NOT NULL,
@@ -199,6 +202,9 @@ CREATE TABLE IF NOT EXISTS files (
     is_test INTEGER NOT NULL DEFAULT 0,
     is_doc INTEGER NOT NULL DEFAULT 0,
     indexed_at TEXT NOT NULL,
+    raw_fingerprint TEXT,
+    redacted_fingerprint TEXT,
+    UNIQUE (repo_id, relative_path),
     FOREIGN KEY(repo_id) REFERENCES repositories(repo_id) ON DELETE CASCADE
 );
 
@@ -214,6 +220,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     signature TEXT,
     doc_comment TEXT,
     fingerprint TEXT NOT NULL,
+    raw_fingerprint TEXT,
+    redacted_fingerprint TEXT,
     FOREIGN KEY(repo_id) REFERENCES repositories(repo_id) ON DELETE CASCADE
 );
 

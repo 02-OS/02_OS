@@ -100,7 +100,7 @@ Generate or automatically install MCP configurations for supported coding agents
 # Print configuration for OpenAI Codex
 02 connect codex
 
-# Install configuration directly into Claude Desktop / Claude Code
+# Install configuration into Claude Code (not Claude Desktop)
 02 connect claude --write
 
 # Print configuration for OpenCode
@@ -114,6 +114,7 @@ Generate or automatically install MCP configurations for supported coding agents
 
 Written configurations use the absolute path of the running `02` executable,
 so a graphical client can start the server without inheriting the shell's PATH.
+An unknown target name writes nothing and the process exits 2.
 Printed snippets keep the portable `02` command. OpenCode and Zed use
 `XDG_CONFIG_HOME` when it is an absolute path, falling back to `~/.config`.
 New configuration files are written atomically with mode `0600`; updates
