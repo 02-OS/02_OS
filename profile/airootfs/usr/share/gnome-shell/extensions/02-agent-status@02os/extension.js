@@ -109,6 +109,7 @@ export default class AgentStatusExtension extends Extension {
 
         this._allow = this._button.menu.addAction('Allow confirmed hash', () => this._decide('allow'));
         this._deny = this._button.menu.addAction('Deny confirmed hash', () => this._decide('deny'));
+        this._button.menu.addAction('Stop desktop automation', () => this._stopDesktop());
 
         Main.panel.addToStatusArea('02-agent-status', this._button);
         this._refresh();
@@ -171,6 +172,21 @@ export default class AgentStatusExtension extends Extension {
             const item = new PopupMenu.PopupMenuItem(label);
             this._button.menu.addMenuItem(item, 0);
             this._rows.push(item);
+        }
+    }
+
+    _stopDesktop() {
+        try {
+            const config = GLib.getenv('XDG_CONFIG_HOME')
+                || GLib.build_filenamev([GLib.get_home_dir(), '.config']);
+            const dir = GLib.build_filenamev([config, '02-agent']);
+            GLib.mkdir_with_parents(dir, 0o700);
+            const path = GLib.build_filenamev([dir, 'desktop-kill']);
+            const file = Gio.File.new_for_path(path);
+            file.replace_contents('stop\n', null, false, Gio.FileCreateFlags.PRIVATE, null);
+            this._notify('Desktop automation is stopped');
+        } catch (_error) {
+            this._notify('Could not write the desktop kill switch');
         }
     }
 
