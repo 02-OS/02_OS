@@ -415,6 +415,13 @@ class OSProfileTests(unittest.TestCase):
         self.assertIn("<Super>l", lock)
         self.assertIn("<Super>Right", focus_right)
         self.assertFalse(lock & focus_right, "Window focus must not intercept screen locking")
+        floating = set(ast.literal_eval(defaults["org/gnome/shell/extensions/pop-shell"]["toggle-floating"]))
+        settings = defaults["org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom2"]
+        self.assertEqual(floating, {"<Super>g"})
+        self.assertEqual(settings["command"], "'gnome-control-center'")
+        self.assertEqual(settings["binding"], "'<Super>i'")
+        for binding in (floating, {settings["binding"].strip("'")}):
+            self.assertFalse(binding & lock, "Developer keys must not take the screen lock")
 
     def test_provisioner_copies_allowlist_and_skips_live_paths(self):
         provision = OVERLAY / "usr/local/bin/02os-provision"
