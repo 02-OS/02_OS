@@ -1,0 +1,20 @@
+# GitHub-hosted runners cannot produce the 02_OS image. This workflow does not
+# start an image build. Pull requests do not start it.
+name: image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  not-on-hosted-runners:
+    name: hosted runners cannot build the image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Document the limit
+        run: |
+          echo "GitHub-hosted runners cannot produce the 02_OS image."
+          echo "This workflow does not run build.sh or bootc/Containerfile."
+          echo "Build locally with ./build.sh when the disk has at least 40 GiB free."
