@@ -51,6 +51,8 @@ Decayed facts are copied into `memory_index` with ids prefixed by `fact:`. `json
 
 `02-agentd` answers `daemon/status` with that phase, the watched repository count, and approval rows already stored. It writes the same object to `~/.local/share/02-agent/status.json` mode `0600`. `daemon/decide` records a decision only when `confirmed_hash` matches the displayed `args_hash`, and it always stores source `gnome`. It does not recompute the hash. The session extension `02-agent-status@02os` reads the file and sends that decision. A live Shell session was not started for this extension either.
 
+`02-desktop` is a separate MCP process and is not started by the session. `desktop-consent` must be mode `0600` and contain `allow`. `desktop-kill` refuses every tool call. The session menu writes that kill file. The process probes a local session bus and then returns an error: it does not link an AT-SPI toolkit, send input events, or open a network connection. Tests use an in-memory accessibility tree.
+
 The `embeddings` feature is off by default. With the feature on, `semantic_hits` still returns nothing, including when `file_vectors` has rows, and `search_content` uses FTS5. No model weights are loaded.
 
 ## Still open
