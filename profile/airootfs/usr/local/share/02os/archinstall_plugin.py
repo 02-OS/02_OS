@@ -13,6 +13,10 @@ OS_TITLE = "02_OS"
 
 # Beyond archinstall's gnome + gnome-tweaks profile. Read from the live image.
 INSTALLED_PACKAGES = "/usr/local/share/02os/installed-packages.txt"
+# Installed only when the live user passed --developer. The default path
+# does not read this list.
+DEVELOPER_PACKAGES = "/usr/local/share/02os/developer-packages.txt"
+DEVELOPER_FLAG = "O2OS_DEVELOPER"
 
 
 def _read_installed_packages(path):
@@ -23,6 +27,12 @@ def _read_installed_packages(path):
             if line:
                 packages.append(line)
     return packages
+
+
+def _developer_selected():
+    import os
+
+    return os.environ.get(DEVELOPER_FLAG) == "1"
 
 
 class Plugin:
@@ -219,6 +229,13 @@ class Plugin:
         packages = _read_installed_packages(INSTALLED_PACKAGES)
         if not packages:
             raise RuntimeError("02_OS installed-system package list is empty")
+        if _developer_selected():
+            extra = _read_installed_packages(DEVELOPER_PACKAGES)
+            if not extra:
+                raise RuntimeError("02_OS developer package list is empty")
+            for name in extra:
+                if name not in packages:
+                    packages.append(name)
         add(packages)
 
     def _provision(self, installation):

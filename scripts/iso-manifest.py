@@ -31,6 +31,22 @@ def image_identity(path):
     return {"size_bytes": after.st_size, "sha256": digest}
 
 
+def check_published_sha256(iso, digest):
+    """Match a sha256sum sidecar when release wrote one. Absence is not a failure."""
+    sidecar = iso.parent / "02_OS.sha256"
+    if not sidecar.exists():
+        return
+    info = sidecar.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ValueError("02_OS.sha256 must be a regular file")
+    lines = [line for line in sidecar.read_text().splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise ValueError("02_OS.sha256 must contain one sha256sum line")
+    parts = lines[0].split()
+    if len(parts) != 2 or parts[0] != digest or parts[1] not in (iso.name, "./" + iso.name):
+        raise ValueError("02_OS.sha256 does not match the ISO")
+
+
 def atomic_write(path, text):
     fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
     try:
@@ -95,6 +111,7 @@ def main():
             actual = image_identity(args.iso)
             if any(manifest.get(key) != value for key, value in actual.items()):
                 raise ValueError("ISO content does not match its completion manifest (size/SHA-256)")
+            check_published_sha256(args.iso, actual["sha256"])
     except (OSError, ValueError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1

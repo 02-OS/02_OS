@@ -235,6 +235,7 @@ class OSProfileTests(unittest.TestCase):
         self.assertGreaterEqual(len(invocations), 1)
 
     def test_plugin_runs_on_archinstall_4_5(self):
+        os.environ.pop("O2OS_DEVELOPER", None)
         # packages.x86_64 installs Extra archinstall 4.5-1. Its load_plugin compares
         # __archinstall__version__ with float(version.rsplit(".", 1)[0]) and still
         # instantiates Plugin(). Installer.minimal_installation calls on_install,
@@ -305,6 +306,22 @@ class OSProfileTests(unittest.TestCase):
                                                      "/usr/local/bin/02os-check-desktop",
                                                      "plymouth-set-default-theme 02-zero-portal"])
         self.assertEqual(installation.initramfs_calls, [["-P"], ["-P"]])
+
+    def test_squashfs_zstd_and_zram_stay_as_shipped(self):
+        profile = (ROOT / "profile/profiledef.sh").read_text()
+        self.assertIn("airootfs_image_tool_options=('-comp' 'zstd' '-Xcompression-level' '15' '-b' '1M')", profile)
+        self.assertIn("bootstrap_tarball_compression=('zstd' '-c' '-T0' '--auto-threads=logical' '--long' '-19')", profile)
+        zram = (OVERLAY / "etc/systemd/zram-generator.conf").read_text().splitlines()
+        self.assertEqual(zram, [
+            "[zram0]",
+            "zram-size = ram / 2",
+            "compression-algorithm = zstd",
+            "swap-priority = 100",
+            "fs-type = swap",
+        ])
+        initramfs = (OVERLAY / "etc/mkinitcpio.conf.d/archiso.conf").read_text()
+        self.assertIn('COMPRESSION="zstd"', initramfs)
+        self.assertIn("COMPRESSION_OPTIONS=(-T0 -15)", initramfs)
 
     def test_product_name_is_02os(self):
         identity = (OVERLAY / "etc/os-release").read_text()
