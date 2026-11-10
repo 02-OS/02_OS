@@ -133,6 +133,7 @@ dependencies = [
  "agent-index",
  "agent-memory",
  "agent-parser",
+ "agent-skills",
  "chrono",
  "git2",
  "serde",
@@ -182,6 +183,17 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "agent-skills"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]

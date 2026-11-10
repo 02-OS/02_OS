@@ -11,6 +11,7 @@ members = [
     "crates/agent-daemon",
     "crates/agent-cli",
     "crates/agent-desktop",
+    "crates/agent-skills",
 ]
 
 [workspace.package]
