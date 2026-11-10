@@ -15,7 +15,6 @@ Pull requests merged in this run:
 - agt #2 lets a local policy file only tighten an allow.
 - agt #3 adds baseline, acceptance, and property checks. Fixture trees stay byte-for-byte.
 - agt #4 records runs, reads an Agent Runtime evidence package, and appends a private audit log.
+- 02_OS #129 records these notes, maps each threat to an existing test, and locks the Capitaine string and the Zero Portal motion digest.
 
 After #125 merged, `df -BG` on `/dev/nvme0n1p2` showed 468G total, 441G used, and 4G available. That is under the 40 GiB host check, so `./build.sh` was not run. No new ISO path was produced. The retained images `2026.09.26`, `2026.10.01`, and `2026.10.06` were not deleted. The image was not booted.
-
-The product-notes commit that adds this file is the last pull request of the run.
