@@ -49,6 +49,8 @@ Decayed facts are copied into `memory_index` with ids prefixed by `fact:`. `json
 
 `02 index` publishes `idle`, `indexing`, `complete`, or `stale` to `~/.local/share/02-agent/index-phase`. The user-session extension `02-index-phase@02os` shows that line on GNOME Shell 51. It is separate from the login portal. A live Shell session was not started here.
 
+`02-agentd` answers `daemon/status` with that phase, the watched repository count, and approval rows already stored. It writes the same object to `~/.local/share/02-agent/status.json` mode `0600`. `daemon/decide` records a decision only when `confirmed_hash` matches the displayed `args_hash`, and it always stores source `gnome`. It does not recompute the hash. The session extension `02-agent-status@02os` reads the file and sends that decision. A live Shell session was not started for this extension either.
+
 The `embeddings` feature is off by default. With the feature on, `semantic_hits` still returns nothing, including when `file_vectors` has rows, and `search_content` uses FTS5. No model weights are loaded.
 
 ## Still open

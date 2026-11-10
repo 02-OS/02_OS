@@ -1,5 +1,15 @@
 use agent_core::{AgentError, Result};
 
+/// One stored approval row. The hash is the digest agt already computed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredApproval {
+    pub id: String,
+    pub run_id: Option<String>,
+    pub command_id: Option<String>,
+    pub args_hash: String,
+    pub decision: String,
+}
+
 /// A decision recorded for an agt command. This runtime does not recompute
 /// `args_hash`. agt is the process that checks the hash.
 #[derive(Debug, Clone)]

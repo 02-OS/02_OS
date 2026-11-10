@@ -204,6 +204,9 @@ class InstalledLauncherTests(unittest.TestCase):
         phase = source / "usr/share/gnome-shell/extensions/02-index-phase@02os"
         phase.mkdir(parents=True)
         (phase / "extension.js").write_text("phase")
+        status = source / "usr/share/gnome-shell/extensions/02-agent-status@02os"
+        status.mkdir(parents=True)
+        (status / "extension.js").write_text("status")
         for rel, contents in {
             "usr/local/bin/02os-check-desktop": "#!/bin/sh\nexit 0\n",
             "usr/local/share/02os/desktop-compatibility.json": "{}\n",

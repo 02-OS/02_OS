@@ -1,5 +1,7 @@
 use agent_core::Result;
-use agent_daemon::{resolve_mcp_repo_path, DaemonSocket, RepoWatcher};
+use agent_daemon::{
+    decide_rpc, publish_daemon_status, resolve_mcp_repo_path, status_rpc, DaemonSocket, RepoWatcher,
+};
 use agent_mcp::McpServer;
 use clap::Parser;
 use serde_json::json;
@@ -77,6 +79,11 @@ fn main() -> Result<()> {
             let errors = watcher_bg.sync_all();
             if errors > 0 {
                 eprintln!("02-agentd: {errors} repository sync(s) failed");
+            }
+            if let Ok(watched) = watcher_bg.list() {
+                if let Err(err) = publish_daemon_status(&watched) {
+                    eprintln!("02-agentd: status snapshot: {err}");
+                }
             }
             thread::sleep(interval_dur);
         }
@@ -247,6 +254,22 @@ fn main() -> Result<()> {
                                         "id": id,
                                         "result": { "repositories": list }
                                     })),
+                                    Err(err) => Some(json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "error": { "code": -32000, "message": err.to_string() }
+                                    })),
+                                },
+                                "daemon/status" => match watcher_conn.list() {
+                                    Ok(list) => Some(status_rpc(id, &list)),
+                                    Err(err) => Some(json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "error": { "code": -32000, "message": err.to_string() }
+                                    })),
+                                },
+                                "daemon/decide" => match watcher_conn.list() {
+                                    Ok(list) => Some(decide_rpc(id, &req_val["params"], &list)),
                                     Err(err) => Some(json!({
                                         "jsonrpc": "2.0",
                                         "id": id,
