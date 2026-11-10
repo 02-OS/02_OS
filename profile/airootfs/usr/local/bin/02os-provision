@@ -151,6 +151,7 @@ required=(
   usr/share/gnome-shell/extensions/compiz-windows-effect@hermes83.github.com
   usr/share/gnome-shell/extensions/02-zero-portal@02os
   usr/share/gnome-shell/extensions/02-index-phase@02os
+  usr/share/gnome-shell/extensions/02-agent-status@02os
   usr/lib/tmpfiles.d/02os-zero-portal.conf
   usr/share/icons/02-OS
   usr/share/icons/hicolor/scalable/apps/02os-logo.svg

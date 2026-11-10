@@ -721,6 +721,30 @@ impl IndexDatabase {
         Ok(())
     }
 
+    /// Approvals already stored for one repository, oldest first.
+    pub fn list_approvals(&self, repo_id: &RepoId) -> Result<Vec<crate::approval::StoredApproval>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, agt_run_id, agt_command_id, args_hash, decision
+                 FROM approvals WHERE repo_id = ?1 ORDER BY created_at",
+            )
+            .map_err(|err| AgentError::Database(format!("approval list failed: {err}")))?;
+        let rows = stmt
+            .query_map(params![repo_id.as_str()], |row| {
+                Ok(crate::approval::StoredApproval {
+                    id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    command_id: row.get(2)?,
+                    args_hash: row.get(3)?,
+                    decision: row.get(4)?,
+                })
+            })
+            .map_err(|err| AgentError::Database(format!("approval list failed: {err}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|err| AgentError::Database(format!("approval row failed: {err}")))
+    }
+
     /// Store an evidence package only when its digest and contract pass.
     pub fn ingest_evidence(
         &self,

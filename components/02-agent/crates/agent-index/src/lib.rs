@@ -10,7 +10,7 @@ pub mod scanner;
 pub mod schema;
 pub mod search;
 
-pub use approval::{admit_approval, ApprovalRequest};
+pub use approval::{admit_approval, ApprovalRequest, StoredApproval};
 pub use datapoint::{InsertedPoint, NewDataPoint, PutPoint};
 pub use db::{IndexDatabase, IndexStats, SymbolDepsResult};
 pub use evidence::{admit_evidence, digest_package, EvidenceIngest};

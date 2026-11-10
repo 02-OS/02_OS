@@ -1,0 +1,9 @@
+{
+  "uuid": "02-agent-status@02os",
+  "name": "02 Agent Status",
+  "description": "Shows the local 02 agent phase, watched repositories, and stored approvals.",
+  "shell-version": ["51"],
+  "session-modes": ["user"],
+  "settings-schema": "org.gnome.shell.extensions.02-agent-status",
+  "version": 1
+}

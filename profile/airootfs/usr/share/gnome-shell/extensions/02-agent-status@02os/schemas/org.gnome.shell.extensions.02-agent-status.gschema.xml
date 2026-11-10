@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.02-agent-status" path="/org/gnome/shell/extensions/02-agent-status/">
+    <key name="poll-seconds" type="i">
+      <default>15</default>
+      <range min="5" max="120"/>
+      <summary>Seconds between status reads</summary>
+    </key>
+    <key name="notifications" type="b">
+      <default>true</default>
+      <summary>Notify on phase changes and new approvals</summary>
+    </key>
+  </schema>
+</schemalist>

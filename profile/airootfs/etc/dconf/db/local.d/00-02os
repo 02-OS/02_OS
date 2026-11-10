@@ -48,7 +48,7 @@ toggle-tiled-right=@as []
 [org/gnome/shell]
 disable-user-extensions=false
 favorite-apps=['02os-install.desktop','org.gnome.Nautilus.desktop','google-chrome.desktop','org.gnome.Console.desktop','org.gnome.Settings.desktop']
-enabled-extensions=['dash-to-dock@micxgx.gmail.com','pop-shell@system76.com','flourish@orsso.github.io','compiz-windows-effect@hermes83.github.com','02-index-phase@02os']
+enabled-extensions=['dash-to-dock@micxgx.gmail.com','pop-shell@system76.com','flourish@orsso.github.io','compiz-windows-effect@hermes83.github.com','02-index-phase@02os','02-agent-status@02os']
 
 [org/gnome/shell/keybindings]
 toggle-message-tray=['<Super>v']

@@ -51,5 +51,12 @@ file_permissions=(
   ["/usr/share/gnome-shell/extensions/02-index-phase@02os/extension.js"]="0:0:644"
   ["/usr/share/gnome-shell/extensions/02-index-phase@02os/metadata.json"]="0:0:644"
   ["/usr/share/gnome-shell/extensions/02-index-phase@02os/stylesheet.css"]="0:0:644"
+  ["/usr/share/gnome-shell/extensions/02-agent-status@02os"]="0:0:755"
+  ["/usr/share/gnome-shell/extensions/02-agent-status@02os/extension.js"]="0:0:644"
+  ["/usr/share/gnome-shell/extensions/02-agent-status@02os/prefs.js"]="0:0:644"
+  ["/usr/share/gnome-shell/extensions/02-agent-status@02os/metadata.json"]="0:0:644"
+  ["/usr/share/gnome-shell/extensions/02-agent-status@02os/stylesheet.css"]="0:0:644"
+  ["/usr/share/gnome-shell/extensions/02-agent-status@02os/schemas"]="0:0:755"
+  ["/usr/share/gnome-shell/extensions/02-agent-status@02os/schemas/org.gnome.shell.extensions.02-agent-status.gschema.xml"]="0:0:644"
   ["/usr/share/backgrounds/02os/portal-halo.png"]="0:0:644"
 )
