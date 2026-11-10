@@ -149,6 +149,9 @@ enum Commands {
 
     #[command(about = "Garbage collect orphaned or stale repository indexes")]
     Gc,
+
+    #[command(about = "Serve a loopback page of agents, token counts, approvals, and evidence")]
+    Dashboard,
 }
 
 #[derive(Subcommand, Debug)]
@@ -215,6 +218,7 @@ fn main() -> ExitCode {
         Commands::Connect { agent, write } => commands::connect::execute(&agent, write),
         Commands::Serve => commands::serve::execute(),
         Commands::Gc => commands::gc::execute(cli.json),
+        Commands::Dashboard => commands::dashboard::execute(),
     };
 
     match result {
