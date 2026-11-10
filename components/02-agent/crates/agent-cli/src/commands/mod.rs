@@ -2,6 +2,7 @@ pub mod add;
 pub mod cognify;
 pub mod connect;
 pub mod context;
+pub mod dashboard;
 pub mod deps;
 pub mod doctor;
 pub mod gc;
