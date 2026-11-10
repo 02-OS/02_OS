@@ -3,6 +3,7 @@ import importlib.util
 from enum import Enum
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -28,6 +29,8 @@ class InstalledBootTests(unittest.TestCase):
         finally:
             sys.dont_write_bytecode = previous
         module.INSTALLED_PACKAGES = ROOT / "profile/airootfs/usr/local/share/02os/installed-packages.txt"
+        module.DEVELOPER_PACKAGES = ROOT / "profile/airootfs/usr/local/share/02os/developer-packages.txt"
+        os.environ.pop("O2OS_DEVELOPER", None)
         self.module = module
         self.plugin = module.Plugin()
 
@@ -86,6 +89,19 @@ class InstalledBootTests(unittest.TestCase):
         desktop = self.module._read_installed_packages(self.module.INSTALLED_PACKAGES)
         self.assertEqual(target.add_additional_packages.call_args.args, (desktop,))
         self.assertEqual(target.arch_chroot.call_args.args, ("plymouth-set-default-theme 02-zero-portal",))
+
+    def test_developer_packages_are_absent_unless_the_flag_is_set(self):
+        target = self.installation(["base", "udev", "kms", "filesystems"])
+        self.plugin._install_desktop_packages(target)
+        desktop = self.module._read_installed_packages(self.module.INSTALLED_PACKAGES)
+        developer = self.module._read_installed_packages(self.module.DEVELOPER_PACKAGES)
+        self.assertTrue(developer)
+        self.assertTrue(set(developer).isdisjoint(desktop))
+        self.assertEqual(target.add_additional_packages.call_args.args, (desktop,))
+        with patch.dict(os.environ, {"O2OS_DEVELOPER": "1"}):
+            selected = self.installation(["base", "udev", "kms", "filesystems"])
+            self.plugin._install_desktop_packages(selected)
+        self.assertEqual(selected.add_additional_packages.call_args.args, (desktop + developer,))
 
     def test_plymouth_package_failure_precedes_provisioned_configuration(self):
         target = self.installation(["base", "udev", "kms", "filesystems"])

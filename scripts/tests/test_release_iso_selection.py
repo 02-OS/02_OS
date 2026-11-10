@@ -1,4 +1,5 @@
 """Fresh releases pick the ISO this run wrote; --reuse-iso stays strict."""
+import hashlib
 import os
 import shlex
 import shutil
@@ -74,6 +75,27 @@ class ReleaseIsoSelectionTests(unittest.TestCase):
             text=True,
             timeout=30,
         )
+
+    def test_published_sha256_must_match_the_iso(self):
+        iso = self.out / "02_OS-2099.10.06-x86_64.iso"
+        payload = b"image-bytes"
+        iso.write_bytes(payload)
+        self.complete(iso)
+        digest = hashlib.sha256(payload).hexdigest()
+        sidecar = self.out / "02_OS.sha256"
+        sidecar.write_text(f"{digest}  {iso.name}\n")
+        good = subprocess.run(
+            ["python3", str(self.manifest), "verify", str(iso), self.head],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(good.returncode, 0, good.stderr)
+        sidecar.write_text(f"{'0' * 64}  {iso.name}\n")
+        bad = subprocess.run(
+            ["python3", str(self.manifest), "verify", str(iso), self.head],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("02_OS.sha256", bad.stderr)
 
     def test_fresh_build_selects_new_iso_when_an_older_one_exists(self):
         old = self.out / "02_OS-2099.10.05-x86_64.iso"

@@ -14,12 +14,30 @@ Install 02_OS
 
 Choose the GNOME desktop profile when the installer asks which desktop to install.
 Partitioning, user account, and bootloader prompts still run.
+The default install stays that desktop profile. Pass --developer to also
+install the developer package list. That list is not installed otherwise.
 After the base system is installed, and again after the desktop packages
 are installed, the 02_OS provisioner copies the 02 desktop profile, agent
 binaries, user daemon, and branding into the new system.
 EOF
 
-if [[ "$(id -u)" -ne 0 ]]; then
-  exec sudo -- archinstall --plugin /usr/local/share/02os/archinstall_plugin.py --skip-version-check "$@"
+developer=0
+kept=()
+for arg in "$@"; do
+  if [[ "${arg}" == "--developer" ]]; then
+    developer=1
+  else
+    kept+=("${arg}")
+  fi
+done
+if [[ "${developer}" -eq 1 ]]; then
+  export O2OS_DEVELOPER=1
+  sudo_env=(--preserve-env=O2OS_DEVELOPER)
+else
+  sudo_env=()
 fi
-exec archinstall --plugin /usr/local/share/02os/archinstall_plugin.py --skip-version-check "$@"
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  exec sudo "${sudo_env[@]}" -- archinstall --plugin /usr/local/share/02os/archinstall_plugin.py --skip-version-check "${kept[@]}"
+fi
+exec archinstall --plugin /usr/local/share/02os/archinstall_plugin.py --skip-version-check "${kept[@]}"

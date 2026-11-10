@@ -1,0 +1,7 @@
+# Developer tools. 02os-install --developer is the only selector.
+# The default desktop install does not read this file.
+gcc
+make
+pkgconf
+gdb
+strace
