@@ -1,0 +1,8 @@
+{
+  "uuid": "02-index-phase@02os",
+  "name": "02 Index Phase",
+  "description": "Shows the 02 agent index phase for this session.",
+  "shell-version": ["51"],
+  "session-modes": ["user"],
+  "version": 1
+}

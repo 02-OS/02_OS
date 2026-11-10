@@ -6,7 +6,8 @@
     "pop-shell@system76.com",
     "flourish@orsso.github.io",
     "compiz-windows-effect@hermes83.github.com",
-    "02-zero-portal@02os"
+    "02-zero-portal@02os",
+    "02-index-phase@02os"
   ],
   "installer_api": {
     "add_bootloader": ["bootloader", "uki_enabled", "bootloader_removable", "plymouth"],

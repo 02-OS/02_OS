@@ -1,6 +1,8 @@
 use crate::{
     budget::{estimate_tokens, BudgetManager},
+    order::order_compiled_files,
     ranking::TaskKeywords,
+    score::{is_entry_path, score_file, ScoreBreakdown, ScoreInput},
     types::{
         BudgetReport, DependencyNode, EvidencePackage, GitContextSummary, RecentCommit, ScoredFile,
         ScoredSymbol, ScoredTest,
@@ -10,7 +12,7 @@ use agent_core::{
     config::RepoConfig,
     contain::{read_indexed_bytes, validate_evidence_file},
     paths::StoragePaths,
-    types::{MemoryStatus, SecretPattern},
+    types::{MemoryStatus, ReferenceKind, SecretPattern},
     AgentError, Result,
 };
 use agent_git::GitRepo;
@@ -282,12 +284,17 @@ impl ContextCompiler {
             });
         }
 
-        // Sort files by score descending
+        // Sort by the locked compile score. Rank breaks ties, then the path.
         let mut sorted_files: Vec<(String, f64, Vec<String>)> = file_scores
             .into_iter()
             .map(|(path, (score, reasons))| (path, score, reasons))
             .collect();
-        sorted_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let rank_totals = Self::rank(root, task)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| (row.path, row.total))
+            .collect();
+        order_compiled_files(&mut sorted_files, &rank_totals);
 
         // Sort symbols by score descending
         candidate_symbols.sort_by(|a, b| {
@@ -411,6 +418,110 @@ impl ContextCompiler {
         };
         enforce_budget(&mut package)?;
         Ok(package)
+    }
+
+    /// Rank indexed files for a task.
+    ///
+    /// `compile` is still the path that redacts and packs evidence. This method
+    /// is the multi-signal ranking kernel used by navigation tools.
+    pub fn rank<P: AsRef<Path>>(repo_root: P, task: &str) -> Result<Vec<ScoreBreakdown>> {
+        let git_repo = GitRepo::open(repo_root)?;
+        let repo_info = git_repo.info()?;
+        let repo_id = &repo_info.id;
+        let db_path = StoragePaths::repo_db_path(repo_id)?;
+        if !db_path.exists() {
+            return Err(AgentError::General(
+                "Repository is not indexed yet. Run '02 init' or '02 index' first.".to_string(),
+            ));
+        }
+        let db = IndexDatabase::open(&db_path)?;
+        let keywords = TaskKeywords::parse(task);
+        let mut exact_ids = HashSet::new();
+        let mut exact_counts: HashMap<String, usize> = HashMap::new();
+        let mut partial_counts: HashMap<String, usize> = HashMap::new();
+        for term in &keywords.terms {
+            if let Ok(symbols) = db.find_symbols_by_name(repo_id, term) {
+                for symbol in symbols {
+                    exact_ids.insert(symbol.id.clone());
+                    *exact_counts.entry(symbol.file_path).or_insert(0) += 1;
+                }
+            }
+            if let Ok(symbols) = db.search_symbols(repo_id, term, 25) {
+                for symbol in symbols {
+                    if exact_ids.contains(&symbol.id) {
+                        continue;
+                    }
+                    *partial_counts.entry(symbol.file_path).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut tested_files = HashSet::new();
+        if let Ok(references) = db.list_references(repo_id.as_str()) {
+            let symbols = db.list_symbols(repo_id.as_str()).unwrap_or_default();
+            let symbol_files: HashMap<&str, &str> = symbols
+                .iter()
+                .map(|symbol| (symbol.name.as_str(), symbol.file_path.as_str()))
+                .collect();
+            for reference in &references {
+                if reference.kind == ReferenceKind::Tests {
+                    if let Some(path) = symbol_files.get(reference.target_name.as_str()) {
+                        tested_files.insert((*path).to_string());
+                    }
+                }
+            }
+        }
+
+        let mut touches: HashMap<String, usize> = HashMap::new();
+        if let Ok(commits) = git_repo.get_recent_commits(15) {
+            for commit in commits {
+                if let Ok(paths) = git_repo.paths_touched_by_commit(&commit.id) {
+                    for path in paths {
+                        *touches.entry(path).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        let completed = db.completed_index(repo_id)?;
+        let index_stale =
+            !completed.is_some_and(|state| state.head_commit == repo_info.head_commit);
+
+        let mut ranked = Vec::new();
+        for file in db.list_files(repo_id)? {
+            if SecretPattern::is_secret(Path::new(&file.relative_path)) {
+                continue;
+            }
+            let test_distance = if file.is_test
+                && (exact_counts.contains_key(&file.relative_path)
+                    || partial_counts.contains_key(&file.relative_path))
+            {
+                Some(0)
+            } else if tested_files.contains(&file.relative_path) {
+                Some(1)
+            } else {
+                None
+            };
+            ranked.push(score_file(&ScoreInput {
+                path: &file.relative_path,
+                exact_symbols: exact_counts.get(&file.relative_path).copied().unwrap_or(0),
+                partial_symbols: partial_counts
+                    .get(&file.relative_path)
+                    .copied()
+                    .unwrap_or(0),
+                test_distance,
+                commits_touching: touches.get(&file.relative_path).copied().unwrap_or(0),
+                kind: &file.kind.to_string(),
+                is_entry: is_entry_path(&file.relative_path),
+                index_stale,
+            }));
+        }
+        ranked.sort_by(|left, right| {
+            right
+                .total
+                .total_cmp(&left.total)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        Ok(ranked)
     }
 }
 

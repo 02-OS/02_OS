@@ -64,6 +64,10 @@ pub fn execute(json_output: bool) -> Result<()> {
 
     let diff_files = git_repo.get_diff_files()?;
     let completed = db.completed_index(&repo_info.id)?;
+    let index_phase = completed
+        .as_ref()
+        .map(|state| agent_core::phase_label(&state.phase).to_string())
+        .unwrap_or_else(|| "idle".to_string());
     let is_index_fresh = completed.is_some_and(|state| {
         state.head_commit == repo_info.head_commit
             && state.fingerprint
@@ -96,6 +100,7 @@ pub fn execute(json_output: bool) -> Result<()> {
             "last_indexed_commit": stats.last_indexed_commit,
             "last_indexed_at": stats.last_indexed_at,
             "is_index_fresh": is_index_fresh,
+            "index_phase": index_phase,
             "watching": watching,
             "daemon_available": daemon_available,
             "memories": {
@@ -155,6 +160,7 @@ pub fn execute(json_output: bool) -> Result<()> {
             "  Symbols Parsed:   {} symbols, {} references",
             stats.total_symbols, stats.total_references
         );
+        println!("  Index phase:      {index_phase}");
         println!(
             "  Memories:         {} total ({} fresh, {} degraded, {} stale)",
             memories.len(),

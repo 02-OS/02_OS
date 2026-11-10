@@ -17,6 +17,7 @@ thiserror.workspace = true
 libc.workspace = true
 sha2.workspace = true
 hex.workspace = true
+rusqlite.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

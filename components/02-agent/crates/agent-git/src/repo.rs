@@ -423,6 +423,71 @@ impl GitRepo {
         }
         Ok(paths)
     }
+
+    /// Local branch short names, sorted.
+    pub fn list_local_branches(&self) -> Result<Vec<String>> {
+        let branches = self
+            .repo
+            .branches(Some(git2::BranchType::Local))
+            .map_err(|err| AgentError::Git(format!("branch list failed: {err}")))?;
+        let mut names = Vec::new();
+        for branch in branches {
+            let (branch, _) =
+                branch.map_err(|err| AgentError::Git(format!("branch entry failed: {err}")))?;
+            if let Some(name) = branch.name().ok().flatten() {
+                names.push(name.to_string());
+            }
+        }
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    /// Summary of one commit. The caller redacts author and summary before display.
+    pub fn commit_info(&self, commit_id: &str) -> Result<GitCommitInfo> {
+        let oid = git2::Oid::from_str(commit_id)
+            .map_err(|err| AgentError::Git(format!("Invalid commit id: {err}")))?;
+        let commit = self
+            .repo
+            .find_commit(oid)
+            .map_err(|err| AgentError::Git(format!("Commit not found: {err}")))?;
+        let hex = oid.to_string();
+        let short_id = if hex.len() >= 7 {
+            hex[..7].to_string()
+        } else {
+            hex.clone()
+        };
+        let summary = commit.summary().unwrap_or("").to_string();
+        let author = commit.author().name().unwrap_or("Unknown").to_string();
+        let timestamp = commit.time().seconds();
+        Ok(GitCommitInfo {
+            id: hex,
+            short_id,
+            summary,
+            author,
+            timestamp,
+        })
+    }
+
+    /// Recent commits whose diff touches `relative_path`.
+    pub fn commits_touching(
+        &self,
+        relative_path: &str,
+        limit: usize,
+    ) -> Result<Vec<GitCommitInfo>> {
+        let recent = self.get_recent_commits(200)?;
+        let mut matched = Vec::new();
+        for commit in recent {
+            if matched.len() >= limit {
+                break;
+            }
+            let paths = self.paths_touched_by_commit(&commit.id)?;
+            if paths.iter().any(|path| path == relative_path) {
+                matched.push(commit);
+            }
+        }
+        Ok(matched)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

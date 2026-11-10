@@ -450,3 +450,20 @@ fn existing_pre_v5_sidecar_is_left_in_place() {
     drop(db);
     assert_eq!(fs::read(&sidecar).unwrap(), b"keep-me");
 }
+
+#[test]
+fn current_catalog_opens_while_a_writer_holds_the_reserved_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("index.sqlite");
+    let writer = IndexDatabase::open(&db_path).unwrap();
+    writer.conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+    match IndexDatabase::open(&db_path) {
+        Ok(reader) => {
+            assert_eq!(reader.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        }
+        Err(other) => panic!("current catalog required a write lock to open: {other}"),
+    }
+
+    writer.conn.execute_batch("ROLLBACK;").unwrap();
+}

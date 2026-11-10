@@ -47,5 +47,9 @@ file_permissions=(
   ["/usr/share/gnome-shell/extensions/02-zero-portal@02os/motion.js"]="0:0:644"
   ["/usr/share/gnome-shell/extensions/02-zero-portal@02os/metadata.json"]="0:0:644"
   ["/usr/share/gnome-shell/extensions/02-zero-portal@02os/stylesheet.css"]="0:0:644"
+  ["/usr/share/gnome-shell/extensions/02-index-phase@02os"]="0:0:755"
+  ["/usr/share/gnome-shell/extensions/02-index-phase@02os/extension.js"]="0:0:644"
+  ["/usr/share/gnome-shell/extensions/02-index-phase@02os/metadata.json"]="0:0:644"
+  ["/usr/share/gnome-shell/extensions/02-index-phase@02os/stylesheet.css"]="0:0:644"
   ["/usr/share/backgrounds/02os/portal-halo.png"]="0:0:644"
 )
