@@ -487,17 +487,12 @@ impl SecretPattern {
 
         // Substring matches for credential filenames. Source files such as
         // `secret_rotation.go` stay in the catalog; their bodies are redacted.
-        if !is_source_file_name(&file_name)
+        !is_source_file_name(&file_name)
             && !file_name.ends_with(".md")
             && !file_name.ends_with(".txt")
             && (file_name.contains("secret")
                 || file_name.contains("credential")
                 || file_name.contains("private_key"))
-        {
-            return true;
-        }
-
-        false
     }
 
     /// Replace documented credential patterns with `[REDACTED]` without allocating on clean input.
