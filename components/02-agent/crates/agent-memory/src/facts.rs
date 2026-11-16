@@ -79,20 +79,35 @@ impl FactStore {
     }
 
     pub fn upsert(&self, fact: &Fact) -> Result<()> {
+        self.upsert_batch(std::slice::from_ref(fact))
+    }
+
+    pub fn upsert_batch(&self, facts: &[Fact]) -> Result<()> {
+        if facts.is_empty() {
+            return Ok(());
+        }
         self.conn
-            .execute(
-                "INSERT INTO facts (
-                    id, repo_id, claim, relative_path, symbol, commit_id,
-                    base_confidence, confidence, source, anchored_at, decayed_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                 ON CONFLICT(id) DO UPDATE SET
-                    claim = excluded.claim,
-                    confidence = excluded.confidence,
-                    base_confidence = excluded.base_confidence,
-                    commit_id = excluded.commit_id,
-                    anchored_at = excluded.anchored_at,
-                    decayed_at = excluded.decayed_at",
-                params![
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|err| AgentError::Database(format!("fact batch begin failed: {err}")))?;
+        let res = (|| -> Result<()> {
+            let mut stmt = self
+                .conn
+                .prepare_cached(
+                    "INSERT INTO facts (
+                        id, repo_id, claim, relative_path, symbol, commit_id,
+                        base_confidence, confidence, source, anchored_at, decayed_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                     ON CONFLICT(id) DO UPDATE SET
+                        claim = excluded.claim,
+                        confidence = excluded.confidence,
+                        base_confidence = excluded.base_confidence,
+                        commit_id = excluded.commit_id,
+                        anchored_at = excluded.anchored_at,
+                        decayed_at = excluded.decayed_at",
+                )
+                .map_err(|err| AgentError::Database(format!("fact batch prepare failed: {err}")))?;
+            for fact in facts {
+                stmt.execute(params![
                     fact.id,
                     fact.repo_id,
                     fact.claim,
@@ -104,10 +119,21 @@ impl FactStore {
                     fact.source,
                     fact.anchored_at,
                     fact.decayed_at
-                ],
-            )
-            .map_err(|err| AgentError::Database(format!("fact upsert failed: {err}")))?;
-        Ok(())
+                ])
+                .map_err(|err| AgentError::Database(format!("fact upsert failed: {err}")))?;
+            }
+            Ok(())
+        })();
+        match res {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT")
+                .map_err(|err| AgentError::Database(format!("fact batch commit failed: {err}"))),
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
     }
 
     pub fn list(&self, repo_id: &str) -> Result<Vec<Fact>> {
@@ -134,24 +160,42 @@ impl FactStore {
             ));
         }
         let facts = self.list_all()?;
+        let now_str = now.to_rfc3339();
         let mut changed = 0;
-        for fact in facts {
-            let updated = DateTime::parse_from_rfc3339(&fact.decayed_at)
-                .map(|stamp| stamp.with_timezone(&Utc))
-                .unwrap_or(now);
-            let next = decayed_confidence(fact.confidence, updated, now, half_life_days);
-            if (next - fact.confidence).abs() < 0.000_000_1 {
-                continue;
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|err| AgentError::Database(format!("fact decay begin failed: {err}")))?;
+        let res = (|| -> Result<usize> {
+            let mut stmt = self
+                .conn
+                .prepare_cached("UPDATE facts SET confidence = ?1, decayed_at = ?2 WHERE id = ?3")
+                .map_err(|err| AgentError::Database(format!("fact decay prepare failed: {err}")))?;
+            for fact in facts {
+                let updated = DateTime::parse_from_rfc3339(&fact.decayed_at)
+                    .map(|stamp| stamp.with_timezone(&Utc))
+                    .unwrap_or(now);
+                let next = decayed_confidence(fact.confidence, updated, now, half_life_days);
+                if (next - fact.confidence).abs() < 0.000_000_1 {
+                    continue;
+                }
+                stmt.execute(params![next, now_str, fact.id])
+                    .map_err(|err| AgentError::Database(format!("fact decay failed: {err}")))?;
+                changed += 1;
             }
-            self.conn
-                .execute(
-                    "UPDATE facts SET confidence = ?1, decayed_at = ?2 WHERE id = ?3",
-                    params![next, now.to_rfc3339(), fact.id],
-                )
-                .map_err(|err| AgentError::Database(format!("fact decay failed: {err}")))?;
-            changed += 1;
+            Ok(changed)
+        })();
+        match res {
+            Ok(count) => {
+                self.conn.execute_batch("COMMIT").map_err(|err| {
+                    AgentError::Database(format!("fact decay commit failed: {err}"))
+                })?;
+                Ok(count)
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
         }
-        Ok(changed)
     }
 
     /// Confidence a reader should use, including time passed since the last decay write.

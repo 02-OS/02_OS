@@ -24,12 +24,21 @@ systemctl --user import-environment \
   XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE 2>/dev/null || true
 dbus-update-activation-environment --systemd --all 2>/dev/null || true
 
-runtime_dir="${XDG_RUNTIME_DIR:-/tmp}"
-log_file="${runtime_dir}/02os-gnome-session.log"
-count_file="${runtime_dir}/02os-gnome-session.failures"
-umask 022
+runtime_base="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+if [[ ! -d "${runtime_base}" ]]; then
+  runtime_base="${HOME:-/tmp}/.cache"
+fi
+state_dir="${runtime_base}/02os-gnome-session"
+umask 077
+mkdir -p -m 0700 "${state_dir}"
+chmod 700 "${state_dir}" 2>/dev/null || true
+log_file="${state_dir}/session.log"
+count_file="${state_dir}/session.failures"
+if [[ -L "${log_file}" || -L "${count_file}" ]]; then
+  exit 1
+fi
 touch "${log_file}"
-chmod 644 "${log_file}" 2>/dev/null || true
+chmod 600 "${log_file}" 2>/dev/null || true
 
 failures=0
 if [[ -f "${count_file}" ]]; then
@@ -39,7 +48,10 @@ fi
 if [[ "${failures}" -ge 3 ]]; then
   echo 0 > "${count_file}"
   echo "$(date -Is) falling back to agreety after ${failures} gnome-session failures" >> "${log_file}"
-  exec agreety --cmd /usr/local/bin/02os-gnome-session
+  if [[ -n "${GREETD_SOCK:-}" && -S "${GREETD_SOCK}" ]] && command -v agreety >/dev/null 2>&1; then
+    exec agreety --cmd /usr/local/bin/02os-gnome-session
+  fi
+  exit 1
 fi
 
 /usr/bin/gnome-session

@@ -1,4 +1,6 @@
-use agent_core::{error::AgentError, paths::StoragePaths, types::SecretPattern, Result};
+use agent_core::{
+    error::AgentError, paths::StoragePaths, truncate_chars, types::SecretPattern, Result,
+};
 use agent_git::{GitDiscovery, GitRepo};
 use agent_index::IndexDatabase;
 use serde_json::json;
@@ -44,7 +46,7 @@ pub fn execute(name: &str, json_output: bool) -> Result<()> {
                 if let Some(ref sig) = sym.signature {
                     println!("    Signature:   {}", sig.trim());
                 }
-                println!("    Fingerprint: {}", &sym.fingerprint[..12]);
+                println!("    Fingerprint: {}", truncate_chars(&sym.fingerprint, 12));
             }
         }
         println!("==================================================");

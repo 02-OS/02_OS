@@ -1,5 +1,14 @@
 # Scaffold only. ./build.sh does not call this file and does not build an image
 # from it. GitHub-hosted runners cannot produce the 02_OS ISO either.
+# Pass `--target bootc-rootfs` when building an ostree/bootc container rootfs explicitly.
+FROM archlinux:latest AS bootc-rootfs
+LABEL org.opencontainers.image.title="02_OS bootc rootfs"
+COPY profile/airootfs/etc/os-release /etc/os-release
+COPY profile/airootfs/etc/sysctl.d/99-02os-performance.conf /etc/sysctl.d/99-02os-performance.conf
+COPY profile/airootfs/etc/systemd/zram-generator.conf /etc/systemd/zram-generator.conf
+COPY profile/airootfs/usr/local/bin/02os-check-desktop /usr/local/bin/02os-check-desktop
+COPY profile/airootfs/usr/local/share/02os/desktop-compatibility.json /usr/local/share/02os/desktop-compatibility.json
+
 FROM scratch
 LABEL org.opencontainers.image.title="02_OS"
 LABEL org.opencontainers.image.description="Scaffold only. build.sh does not call this file."

@@ -42,7 +42,13 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: components/02-agent
       - name: Install regression validators
         run: sudo apt-get update && sudo apt-get install -y desktop-file-utils libglib2.0-bin dconf-cli gnupg
       - name: Build actual CLI and daemon with locked dependencies

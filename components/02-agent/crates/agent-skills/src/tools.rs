@@ -31,7 +31,9 @@ const KNOWN_TOOLS: &[&str] = &[
     "list_files",
     "list_tests",
     "memory_get",
+    "memory_list",
     "memory_status",
+    "memory_verify",
     "memory_write",
     "rank_files",
     "references_in_file",
@@ -47,6 +49,7 @@ const KNOWN_TOOLS: &[&str] = &[
     "tests_covering",
     "workspace_repos",
     "workspace_search",
+    "workspace_symbols",
 ];
 
 pub fn known_tools() -> &'static [&'static str] {

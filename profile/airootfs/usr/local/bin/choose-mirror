@@ -1,24 +1,28 @@
 #!/bin/bash
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
+set -euo pipefail
 
 get_cmdline() {
     local param
+    [[ -r /proc/cmdline ]] || return 0
     for param in $(</proc/cmdline); do
         case "${param}" in
             "${1}="*)
-                echo "${param##*=}"
+                echo "${param#*=}"
                 return 0
                 ;;
         esac
     done
 }
 
-mirror="$(get_cmdline mirror)"
-[[ "$mirror" == 'auto' ]] && mirror="$(get_cmdline archiso_http_srv)"
-[[ -n "$mirror" ]] || exit 0
+mirror="$(get_cmdline mirror || true)"
+[[ "${mirror}" == 'auto' ]] && mirror="$(get_cmdline archiso_http_srv || true)"
+[[ -n "${mirror}" ]] || exit 0
 
-mv /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.orig
+if [[ -f /etc/pacman.d/mirrorlist && ! -f /etc/pacman.d/mirrorlist.orig ]]; then
+    cp -a /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.orig
+fi
 cat >/etc/pacman.d/mirrorlist <<EOF
 #
 # Arch Linux repository mirrorlist

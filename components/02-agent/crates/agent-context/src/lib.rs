@@ -15,6 +15,6 @@ pub use order::order_compiled_files;
 pub use ranking::TaskKeywords;
 pub use score::{score_file, ScoreBreakdown, ScoreInput};
 pub use types::{
-    BudgetReport, DependencyNode, EvidencePackage, GitContextSummary, ScoredFile, ScoredSymbol,
-    ScoredTest,
+    BudgetReport, DependencyNode, EvidencePackage, GitContextSummary, ScoredFact, ScoredFile,
+    ScoredSymbol, ScoredTest,
 };

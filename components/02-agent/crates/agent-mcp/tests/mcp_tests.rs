@@ -729,3 +729,341 @@ fn unknown_connect_target_writes_nothing() {
     assert!(preview.to_string().contains("unsupported connect target"));
     assert_eq!(fs::read_dir(home.path()).unwrap().count(), 0);
 }
+
+#[test]
+fn mcp_confinement_rejects_outside_repo_and_allows_nested_subdir() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo_a");
+    let nested = root.join("src");
+    let outside = dir.path().join("repo_b");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let _repo_a = Repository::init(&root).unwrap();
+    let _repo_b = Repository::init(&outside).unwrap();
+    fs::write(nested.join("lib.rs"), "pub fn inner() {}\n").unwrap();
+
+    let server = McpServer::with_allowed_roots(root.clone(), vec![root.clone()]);
+    let outside_call = server
+        .handle_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "git_status",
+                "arguments": { "repo_path": outside.to_str().unwrap() }
+            }
+        }))
+        .unwrap();
+    assert_eq!(outside_call["result"]["isError"], true);
+    assert!(outside_call["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("outside allowed workspace"));
+
+    let nested_call = server
+        .handle_json(json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "git_status",
+                "arguments": { "repo_path": nested.to_str().unwrap() }
+            }
+        }))
+        .unwrap();
+    assert_ne!(nested_call["result"]["isError"], true, "{nested_call}");
+}
+
+#[test]
+fn mcp_run_tests_rejects_flag_injection() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let _repo = Repository::init(root).unwrap();
+    let res = agent_mcp::call_tool(root, "run_tests", &json!({ "filter": "--nocapture" }));
+    assert!(res.is_error, "{res:?}");
+    assert!(res.content[0].text.contains("non-leading-dash"));
+}
+
+#[test]
+fn mcp_evidence_package_trims_cleanly_as_valid_json() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let repo = Repository::init(root).unwrap();
+    let sig = git2::Signature::now("Tester", "test@02os.org").unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    for idx in 0..35 {
+        let path = root.join(format!("src/mod_{idx:02}.rs"));
+        let mut src = format!("pub fn fn_{idx:02}() {{\n");
+        for line in 0..80 {
+            src.push_str(&format!(
+                "    let _val_{line} = \"giant_evidence_payload_marker_{idx}_{line}\";\n"
+            ));
+        }
+        src.push_str("}\n");
+        fs::write(&path, src).unwrap();
+    }
+    let mut index = repo.index().unwrap();
+    index
+        .add_all(["*"].iter(), git2::IndexAddOption::FORCE, None)
+        .unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let commit_id = repo
+        .commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+
+    let repo_id = RepoId::from_path(root);
+    let db_path = agent_core::paths::StoragePaths::repo_db_path(&repo_id).unwrap();
+    let mut db = IndexDatabase::open(&db_path).unwrap();
+    let info = RepoInfo {
+        id: repo_id.clone(),
+        name: "trim_repo".into(),
+        root_path: root.to_path_buf(),
+        head_commit: Some(commit_id.to_string()),
+        branch: Some("master".into()),
+        is_clean: true,
+        modified_count: 0,
+        untracked_count: 0,
+    };
+    db.update_repo_info(&info).unwrap();
+    let scanned = RepoScanner::new(root, RepoConfig::default()).scan();
+    db.save_scanned_files(&repo_id, &scanned).unwrap();
+    db.complete_index(
+        &info,
+        &RepoScanner::scan_fingerprint(&scanned, &RepoConfig::default()),
+    )
+    .unwrap();
+    drop(db);
+
+    let res = agent_mcp::call_tool(
+        root,
+        "evidence_package",
+        &json!({ "task": "giant_evidence_payload_marker", "budget": 100000 }),
+    );
+    assert!(!res.is_error, "{res:?}");
+    let text = &res.content[0].text;
+    let outer: serde_json::Value = serde_json::from_str(text).expect("valid outer JSON");
+    let pkg_str = outer["package"].as_str().unwrap();
+    assert!(
+        pkg_str.chars().count() <= 20_000,
+        "unexpected size {}",
+        pkg_str.chars().count()
+    );
+    let inner: serde_json::Value =
+        serde_json::from_str(pkg_str).expect("valid trimmed package JSON");
+    assert_eq!(inner["task"], "giant_evidence_payload_marker");
+    assert!(outer["truncated"].is_boolean());
+    let _ = fs::remove_dir_all(db_path.parent().unwrap());
+}
+
+#[test]
+fn mcp_batch_resources_pagination_and_session_policy() {
+    use agent_skills::{AgentId, CapabilityToken, SessionPolicy, SharedContextScope, Skill};
+
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let repo = Repository::init(root).unwrap();
+    let sig = git2::Signature::now("Tester", "test@02os.org").unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn alpha_fn() {}\npub fn alpha_helper() {}\npub fn alpha_third() {}\n",
+    )
+    .unwrap();
+    let mut index = repo.index().unwrap();
+    index
+        .add_all(["*"].iter(), git2::IndexAddOption::FORCE, None)
+        .unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let commit_id = repo
+        .commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+
+    let repo_id = RepoId::from_path(root);
+    let db_path = agent_core::paths::StoragePaths::repo_db_path(&repo_id).unwrap();
+    let mut db = IndexDatabase::open(&db_path).unwrap();
+    let info = RepoInfo {
+        id: repo_id.clone(),
+        name: "batch_repo".into(),
+        root_path: root.to_path_buf(),
+        head_commit: Some(commit_id.to_string()),
+        branch: Some("master".into()),
+        is_clean: true,
+        modified_count: 0,
+        untracked_count: 0,
+    };
+    db.update_repo_info(&info).unwrap();
+    let scanned = RepoScanner::new(root, RepoConfig::default()).scan();
+    db.save_scanned_files(&repo_id, &scanned).unwrap();
+    let mut syms = Vec::new();
+    for item in &scanned {
+        if let Some(ref c) = item.content {
+            let ext = agent_parser::CodeExtractor::extract(
+                &item.file.relative_path,
+                c,
+                item.file.language,
+            )
+            .unwrap();
+            syms.extend(ext.symbols);
+        }
+    }
+    db.save_symbols_and_references(&repo_id, &syms, &[])
+        .unwrap();
+    db.complete_index(
+        &info,
+        &RepoScanner::scan_fingerprint(&scanned, &RepoConfig::default()),
+    )
+    .unwrap();
+    drop(db);
+
+    let un = McpServer::new(root.to_path_buf());
+    // 1. Batch JSON-RPC + empty batch rejection
+    let empty_batch = un.handle_json(json!([])).unwrap();
+    assert_eq!(empty_batch["error"]["code"], -32600);
+    let batch = un.handle_json(json!([
+        {"jsonrpc": "2.0", "id": 1, "method": "resources/list", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": "02://repo/src/lib.rs"}},
+        {"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": "02://repo/../../etc/passwd"}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"}
+    ])).unwrap();
+    let arr = batch.as_array().unwrap();
+    assert_eq!(arr.len(), 3);
+    assert!(arr[0]["result"]["resources"].as_array().unwrap().len() >= 2);
+    assert!(arr[1]["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("alpha_fn"));
+    assert!(arr[2]["error"].is_object());
+
+    // 2. Cursor pagination on workspace_symbols
+    let p1 = un.handle_json(json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {"name": "workspace_symbols", "arguments": {"query": "alpha", "limit": 2, "cursor": "0"}}
+    })).unwrap();
+    let p1_body: serde_json::Value =
+        serde_json::from_str(p1["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(p1_body["symbols"].as_array().unwrap().len(), 2);
+    assert_eq!(p1_body["next_cursor"], "2");
+    let p2 = un.handle_json(json!({
+        "jsonrpc": "2.0",
+        "id": 11,
+        "method": "tools/call",
+        "params": {"name": "workspace_symbols", "arguments": {"query": "alpha", "limit": 2, "cursor": "2"}}
+    })).unwrap();
+    let p2_body: serde_json::Value =
+        serde_json::from_str(p2["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(p2_body["symbols"].as_array().unwrap().len(), 1);
+    assert!(p2_body["next_cursor"].is_null());
+
+    // 3. SessionPolicy isolation, tool filtering, and expired token denial
+    let skill_a = Skill {
+        name: "read-mem".into(),
+        version: "0.1.0".into(),
+        tools: vec![
+            "memory_write".into(),
+            "memory_list".into(),
+            "memory_verify".into(),
+        ],
+    };
+    let policy_a = SessionPolicy::new(
+        AgentId::parse("agent-a").unwrap(),
+        skill_a.clone(),
+        SharedContextScope::Private,
+    )
+    .with_capability(
+        CapabilityToken::seal_with_ttl("sec-a", 300).unwrap(),
+        "sec-a",
+    );
+    let policy_b = SessionPolicy::new(
+        AgentId::parse("agent-b").unwrap(),
+        skill_a.clone(),
+        SharedContextScope::Private,
+    );
+
+    let srv_a = McpServer::new(root.to_path_buf()).with_policy(policy_a);
+    let srv_b = McpServer::new(root.to_path_buf()).with_policy(policy_b);
+
+    let list_a = srv_a
+        .handle_json(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
+        .unwrap();
+    assert_eq!(list_a["result"]["tools"].as_array().unwrap().len(), 3);
+
+    let denied = srv_a
+        .handle_json(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "repo_overview", "arguments": {}}
+        }))
+        .unwrap();
+    assert_eq!(denied["result"]["isError"], true);
+
+    let write_a = srv_a
+        .handle_json(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "memory_write",
+                "arguments": {
+                    "id": "mem_a",
+                    "claim": "private claim A",
+                    "file": "src/lib.rs",
+                    "symbols": ["alpha_fn"]
+                }
+            }
+        }))
+        .unwrap();
+    assert_ne!(write_a["result"]["isError"], true, "{write_a}");
+
+    let list_b = srv_b
+        .handle_json(json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "memory_list", "arguments": {}}
+        }))
+        .unwrap();
+    let body_b: serde_json::Value =
+        serde_json::from_str(list_b["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body_b["memories"].as_array().unwrap().len(), 0);
+
+    let list_a_mem = srv_a
+        .handle_json(json!({
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": {"name": "memory_list", "arguments": {}}
+        }))
+        .unwrap();
+    let body_a: serde_json::Value =
+        serde_json::from_str(list_a_mem["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body_a["memories"].as_array().unwrap().len(), 1);
+
+    let verify_a = srv_a
+        .handle_json(json!({
+            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+            "params": {"name": "memory_verify", "arguments": {}}
+        }))
+        .unwrap();
+    assert_ne!(verify_a["result"]["isError"], true);
+
+    let expired_policy = SessionPolicy::new(
+        AgentId::parse("agent-a").unwrap(),
+        skill_a,
+        SharedContextScope::Private,
+    )
+    .with_capability(
+        CapabilityToken::seal_with_expiry("sec-a", 1).unwrap(),
+        "sec-a",
+    );
+    let srv_exp = McpServer::new(root.to_path_buf()).with_policy(expired_policy);
+    let exp_call = srv_exp
+        .handle_json(json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {"name": "memory_list", "arguments": {}}
+        }))
+        .unwrap();
+    assert_eq!(exp_call["result"]["isError"], true);
+    assert!(exp_call["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("expired"));
+
+    let _ = fs::remove_dir_all(db_path.parent().unwrap());
+}

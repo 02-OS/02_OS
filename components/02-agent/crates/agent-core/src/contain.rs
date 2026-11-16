@@ -1,9 +1,22 @@
 use crate::error::{AgentError, Result};
+use crate::paths::StoragePaths;
 use crate::types::SecretPattern;
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEMP_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Read cryptographically random bytes from the OS CSPRNG and encode as lowercase hex.
+pub fn random_hex(byte_len: usize) -> Result<String> {
+    let mut bytes = vec![0u8; byte_len];
+    let mut rng = File::open("/dev/urandom")?;
+    rng.read_exact(&mut bytes)?;
+    Ok(hex::encode(bytes))
+}
 
 /// Reject absolute paths, `..`, and NUL so a caller-supplied path cannot leave `root`.
 pub fn reject_escaping_relative(relative: &Path) -> Result<()> {
@@ -99,10 +112,9 @@ fn open_nofollow(path: &Path) -> Result<File> {
     })
 }
 
-fn canonical_inside(root: &Path, path: &Path) -> Result<()> {
-    let root_canon = fs::canonicalize(root)?;
+fn canonical_inside_canon(root_canon: &Path, path: &Path) -> Result<()> {
     let path_canon = fs::canonicalize(path)?;
-    if path_canon.starts_with(&root_canon) {
+    if path_canon.starts_with(root_canon) {
         Ok(())
     } else {
         Err(AgentError::Security(
@@ -116,6 +128,16 @@ struct ContainedFile {
 }
 
 fn open_contained(root: &Path, relative: &Path, max_bytes: u64) -> Result<ContainedFile> {
+    let root_canon = fs::canonicalize(root)?;
+    open_contained_canon(root, &root_canon, relative, max_bytes)
+}
+
+fn open_contained_canon(
+    root: &Path,
+    root_canon: &Path,
+    relative: &Path,
+    max_bytes: u64,
+) -> Result<ContainedFile> {
     if SecretPattern::is_secret(relative) {
         return Err(AgentError::Security(
             "secret filename is not evidence".to_string(),
@@ -143,7 +165,7 @@ fn open_contained(root: &Path, relative: &Path, max_bytes: u64) -> Result<Contai
             "file identity changed while opening".to_string(),
         ));
     }
-    canonical_inside(root, &path)?;
+    canonical_inside_canon(root_canon, &path)?;
     Ok(ContainedFile { file })
 }
 
@@ -153,8 +175,7 @@ pub fn validate_evidence_file(root: &Path, relative: &Path, max_bytes: u64) -> R
     Ok(())
 }
 
-pub fn read_regular_bytes_within(root: &Path, relative: &Path, max_bytes: u64) -> Result<Vec<u8>> {
-    let opened = open_contained(root, relative, max_bytes)?;
+fn read_contained_bytes(opened: ContainedFile, max_bytes: u64) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     opened
         .file
@@ -166,6 +187,11 @@ pub fn read_regular_bytes_within(root: &Path, relative: &Path, max_bytes: u64) -
         ));
     }
     Ok(buf)
+}
+
+pub fn read_regular_bytes_within(root: &Path, relative: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+    let opened = open_contained(root, relative, max_bytes)?;
+    read_contained_bytes(opened, max_bytes)
 }
 
 pub fn read_regular_text_within(root: &Path, relative: &Path, max_bytes: u64) -> Result<String> {
@@ -180,6 +206,124 @@ pub fn read_indexed_bytes(root: &Path, absolute: &Path, max_bytes: u64) -> Resul
         .strip_prefix(root)
         .map_err(|_| AgentError::Security("indexed path is outside the repository".to_string()))?;
     read_regular_bytes_within(root, relative, max_bytes)
+}
+
+/// Read `absolute` using a pre-canonicalized repository root to avoid repeated `canonicalize(root)`.
+pub fn read_indexed_bytes_canon(
+    root: &Path,
+    root_canon: &Path,
+    absolute: &Path,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
+    let relative = absolute
+        .strip_prefix(root)
+        .map_err(|_| AgentError::Security("indexed path is outside the repository".to_string()))?;
+    let opened = open_contained_canon(root, root_canon, relative, max_bytes)?;
+    read_contained_bytes(opened, max_bytes)
+}
+
+/// Stream SHA-256 of a contained regular file without allocating its entire content buffer.
+pub fn hash_indexed_file_canon(
+    root: &Path,
+    root_canon: &Path,
+    absolute: &Path,
+    max_bytes: u64,
+) -> Result<String> {
+    let relative = absolute
+        .strip_prefix(root)
+        .map_err(|_| AgentError::Security("indexed path is outside the repository".to_string()))?;
+    let mut opened = open_contained_canon(root, root_canon, relative, max_bytes)?;
+    let mut hasher = Sha256::new();
+    let mut total: u64 = 0;
+    let mut chunk = [0u8; 32 * 1024];
+    loop {
+        let read = opened.file.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > max_bytes {
+            return Err(AgentError::Security(
+                "file exceeds the configured size limit".to_string(),
+            ));
+        }
+        hasher.update(&chunk[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Atomically create/replace `path` with mode `0o600` using a randomized `O_NOFOLLOW` temp file.
+pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            StoragePaths::ensure_private_dir(parent)?;
+        }
+    }
+    for legacy_tmp in [
+        path.with_extension("tmp"),
+        PathBuf::from(format!("{}.tmp", path.display())),
+    ] {
+        if let Ok(meta) = fs::symlink_metadata(&legacy_tmp) {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(AgentError::Io(std::io::Error::from_raw_os_error(
+                    libc::EISDIR,
+                )));
+            }
+        }
+    }
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let stem = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state");
+    let pid = std::process::id();
+    let mut attempts = 0usize;
+    let (temp_path, mut file) = loop {
+        let seq = TEMP_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nonce = random_hex(8)?;
+        let candidate = dir.join(format!(".{stem}.{pid}.{seq}.{nonce}.tmp"));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && attempts < 16 => {
+                attempts += 1;
+                continue;
+            }
+            Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(AgentError::Security(format!(
+                    "refusing to write through symlink {}",
+                    candidate.display()
+                )));
+            }
+            Err(err) => return Err(AgentError::Io(err)),
+        }
+    };
+    let write_res = (|| -> Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(AgentError::Io(err));
+    }
+    if let Ok(parent_dir) = File::open(dir) {
+        let _ = parent_dir.sync_all();
+    }
+    Ok(())
 }
 
 /// Create a new regular file. An existing symlink is not followed or replaced.

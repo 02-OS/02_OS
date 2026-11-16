@@ -5,7 +5,7 @@
 usage() {
     cat <<-_EOF_
     live cd sound helper script.
-    Usage: livecdsound [OPTION]
+    Usage: livecd-sound [OPTION]
     OPTIONS
         -u, --unmute      unmute all sound cards
         -p, --pick        select a card for speech output
@@ -14,8 +14,12 @@ usage() {
 _EOF_
 }
 
+stat_fail() {
+    exit 1
+}
+
 bugout() {
-    printf "/usr/local/bin/livecdsound: programming error"
+    printf "/usr/local/bin/livecd-sound: programming error\n" >&2
     stat_fail
 }
 
@@ -34,8 +38,8 @@ echo_card_indices() {
 # $3 <level>
 unmute_and_set_level() {
     [[ -n "$3" && -n "$2" && -n "$1" ]] || bugout
-    systemd-cat -t "livecdsound" printf "Setting: %s on card: %s to %s\n" "$2" "$1" "$3"
-    systemd-cat -t "livecdsound" amixer -c "$1" set "$2" "$3" unmute
+    systemd-cat -t "livecd-sound" printf "Setting: %s on card: %s to %s\n" "$2" "$1" "$3"
+    systemd-cat -t "livecd-sound" amixer -c "$1" set "$2" "$3" unmute
     return 0
 }
 
@@ -43,8 +47,8 @@ unmute_and_set_level() {
 # $2 <control>
 mute_and_zero_level() {
     [[ -n "$1" && -n "$2" ]] || bugout
-    systemd-cat -t "livecdsound" printf "Muting control: %s on card: %s\n" "$2" "$1"
-    systemd-cat -t "livecdsound" amixer -c "$1" set "$2" "0%" mute
+    systemd-cat -t "livecd-sound" printf "Muting control: %s on card: %s\n" "$2" "$1"
+    systemd-cat -t "livecd-sound" amixer -c "$1" set "$2" "0%" mute
     return 0
 }
 
@@ -53,8 +57,8 @@ mute_and_zero_level() {
 # $3 "on" | "off"
 switch_control() {
     [[ -n "$3" && -n "$1" ]] || bugout
-    systemd-cat -t "livecdsound" printf "Switching control: %s on card: %s to %s\n" "$2" "$1" "$3"
-    systemd-cat -t "livecdsound" amixer -c "$1" set "$2" "$3"
+    systemd-cat -t "livecd-sound" printf "Switching control: %s on card: %s to %s\n" "$2" "$1" "$3"
+    systemd-cat -t "livecd-sound" amixer -c "$1" set "$2" "$3"
     return 0
 }
 
@@ -170,8 +174,15 @@ is_numeric() {
 
 set_default_card() {
     local card="$1"
-    sed -e "s/%card%/$card/g" </usr/local/share/livecd-sound/asound.conf.in \
-        >/etc/asound.conf
+    if [[ -f /usr/local/share/livecd-sound/asound.conf.in ]]; then
+        sed -e "s/%card%/$card/g" </usr/local/share/livecd-sound/asound.conf.in \
+            >/etc/asound.conf
+    else
+        cat >/etc/asound.conf <<EOF
+defaults.pcm.card ${card}
+defaults.ctl.card ${card}
+EOF
+    fi
 }
 
 play_on_card() {
@@ -189,11 +200,11 @@ pick_a_card() {
     mapfile -t usable_cards < <(list_non_pcsp_cards)
     num_usable_cards="${#usable_cards[@]}"
 
-    if (( num_usable_cards == 1 )); then
-        systemd-cat -t "livecdsound" printf "Only one sound card is detected\n"
+    if (( num_usable_cards <= 1 )); then
+        systemd-cat -t "livecd-sound" printf "Only one sound card is detected\n"
         exit 0
     fi
-    systemd-cat -t "livecdsound" printf "multiple sound cards detected\n"
+    systemd-cat -t "livecd-sound" printf "multiple sound cards detected\n"
     for card in "${usable_cards[@]}"; do
         if ! is_numeric "$card"; then
             continue
@@ -208,7 +219,7 @@ pick_a_card() {
         fi
         play_on_card "$card" /usr/share/livecd-sounds/beep.wav
         if read -r -t 10; then
-            systemd-cat -t "livecdsound" printf "Selecting %s sound card as default\n" "$card"
+            systemd-cat -t "livecd-sound" printf "Selecting %s sound card as default\n" "$card"
             set_default_card "$card"
             break
         fi
@@ -219,14 +230,14 @@ if (( $# == 0 )); then
     echo "error: No argument passed."
     exit 1
 fi
-while [[ "${1}" != "" ]]; do
+while [[ "${1:-}" != "" ]]; do
     case ${1} in
         -h|--help)
             usage
             exit
             ;;
         -u|--unmute)
-            systemd-cat -t "livecdsound" printf "Unmuting all cards"
+            systemd-cat -t "livecd-sound" printf "Unmuting all cards"
             unmute_all_cards
             ;;
         -p|--pick)

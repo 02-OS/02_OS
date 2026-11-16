@@ -139,9 +139,26 @@ class Plugin:
                 parameters.append(parameter)
 
     def _activate_theme(self, installation):
+        from pathlib import Path
+
+        target_root = Path(str(getattr(installation, "target", "")))
+        plymouth_conf = target_root / "etc/plymouth/plymouthd.conf"
+        mkinitcpio_conf = target_root / "etc/mkinitcpio.conf"
+        state = None
+        if plymouth_conf.is_file() and mkinitcpio_conf.is_file():
+            state = (
+                tuple(getattr(installation, "_hooks", ()) or ()),
+                tuple(getattr(installation, "_kernel_params", ()) or ()),
+                plymouth_conf.stat().st_mtime_ns,
+                mkinitcpio_conf.stat().st_mtime_ns,
+            )
+            if getattr(installation, "_02os_theme_activated_state", None) == state:
+                return
         installation.arch_chroot(f"plymouth-set-default-theme {PLYMOUTH_THEME}")
         if not installation.mkinitcpio(["-P"]):
             raise RuntimeError("Could not generate the installed Plymouth initramfs")
+        if state is not None:
+            installation._02os_theme_activated_state = state
 
     def _configure_boot_branding(self, installation):
         # on_install runs before guided.py calls add_bootloader. Archinstall
@@ -239,10 +256,22 @@ class Plugin:
         add(packages)
 
     def _provision(self, installation):
+        from pathlib import Path
         import subprocess
 
         target = str(installation.target)
+        target_root = Path(target)
+        os_release = target_root / "etc/os-release"
+        dconf_db = target_root / "etc/dconf/db/local"
+        if (
+            os_release.is_file()
+            and dconf_db.is_file()
+            and getattr(installation, "_02os_provisioned_target", None) == target
+        ):
+            return
         subprocess.check_call(["/usr/local/bin/02os-provision", target])
+        if os_release.is_file() and dconf_db.is_file():
+            installation._02os_provisioned_target = target
 
 
 def retitle_boot_text(text):

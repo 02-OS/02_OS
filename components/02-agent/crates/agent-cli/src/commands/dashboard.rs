@@ -4,15 +4,28 @@
 //! and does not open another socket.
 
 use agent_core::{paths::StoragePaths, AgentError, Result};
-use serde_json::Value;
-use std::fs;
+use serde_json::{json, Value};
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 pub const LOOPBACK_ADDR: &str = "127.0.0.1:8732";
+const MAX_DASHBOARD_WORKERS: usize = 16;
+const MAX_STATUS_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+struct WorkerGuard(Arc<AtomicUsize>);
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 pub fn execute() -> Result<()> {
     let listener = bind_dashboard(LOOPBACK_ADDR)
@@ -21,12 +34,28 @@ pub fn execute() -> Result<()> {
         .local_addr()
         .map_err(|err| AgentError::General(err.to_string()))?;
     println!("02 dashboard http://{bound}");
+    let active_workers = Arc::new(AtomicUsize::new(0));
     for incoming in listener.incoming() {
         match incoming {
             Ok(mut stream) => {
-                if let Err(err) = handle_client(&mut stream) {
-                    eprintln!("dashboard request failed: {err}");
+                if active_workers.load(Ordering::SeqCst) >= MAX_DASHBOARD_WORKERS {
+                    let _ = write_response_with_type(
+                        &mut stream,
+                        503,
+                        "text/plain; charset=utf-8",
+                        "Dashboard busy",
+                        false,
+                    );
+                    continue;
                 }
+                active_workers.fetch_add(1, Ordering::SeqCst);
+                let guard = WorkerGuard(Arc::clone(&active_workers));
+                thread::spawn(move || {
+                    let _guard = guard;
+                    if let Err(err) = handle_client(&mut stream) {
+                        eprintln!("dashboard request failed: {err}");
+                    }
+                });
             }
             Err(err) => eprintln!("dashboard connection failed: {err}"),
         }
@@ -55,18 +84,57 @@ pub fn bind_dashboard(addr: &str) -> std::io::Result<TcpListener> {
     Ok(listener)
 }
 
+fn parse_method_and_route(line: &str) -> Option<(&str, &str)> {
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?;
+    let target = parts.next().unwrap_or("/");
+    let route = target.split('?').next().unwrap_or(target);
+    Some((method, route))
+}
+
 fn handle_client(stream: &mut TcpStream) -> std::io::Result<()> {
     let request = read_request(stream)?;
     let line = request.lines().next().unwrap_or("");
-    if line.starts_with("GET / ") || line.starts_with("GET / HTTP") || line == "GET /" {
-        let page = render_page(&status_path().unwrap_or_else(|_| PathBuf::from("status.json")));
-        write_response(stream, 200, &page)
-    } else {
-        write_response(
+    let Some((method, route)) = parse_method_and_route(line) else {
+        return write_response(
             stream,
             404,
             "<!DOCTYPE html><title>02 dashboard</title><p>Not found.</p>",
-        )
+        );
+    };
+    let head_only = method.eq_ignore_ascii_case("HEAD");
+    if !head_only && !method.eq_ignore_ascii_case("GET") {
+        return write_response_with_type(
+            stream,
+            405,
+            "text/plain; charset=utf-8",
+            "Method Not Allowed",
+            false,
+        );
+    }
+    let path = status_path().unwrap_or_else(|_| PathBuf::from("status.json"));
+    match route {
+        "/" | "/index.html" => {
+            let page = render_page(&path);
+            write_response_with_type(stream, 200, "text/html; charset=utf-8", &page, head_only)
+        }
+        "/api/status.json" | "/status.json" => {
+            let body = render_status_json(&path);
+            write_response_with_type(
+                stream,
+                200,
+                "application/json; charset=utf-8",
+                &body,
+                head_only,
+            )
+        }
+        _ => write_response_with_type(
+            stream,
+            404,
+            "text/html; charset=utf-8",
+            "<!DOCTYPE html><title>02 dashboard</title><p>Not found.</p>",
+            head_only,
+        ),
     }
 }
 
@@ -76,6 +144,7 @@ fn status_path() -> Result<PathBuf> {
 
 fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let mut buf = [0u8; 1024];
     let mut collected = Vec::new();
     loop {
@@ -92,13 +161,30 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
 }
 
 fn write_response(stream: &mut TcpStream, status: u16, page: &str) -> std::io::Result<()> {
-    let reason = if status == 200 { "OK" } else { "Not Found" };
+    write_response_with_type(stream, status, "text/html; charset=utf-8", page, false)
+}
+
+fn write_response_with_type(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &str,
+    head_only: bool,
+) -> std::io::Result<()> {
+    let reason = match status {
+        200 => "OK",
+        405 => "Method Not Allowed",
+        503 => "Service Unavailable",
+        _ => "Not Found",
+    };
     let header = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
-        page.len()
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\n\r\n",
+        body.len()
     );
     stream.write_all(header.as_bytes())?;
-    stream.write_all(page.as_bytes())?;
+    if !head_only {
+        stream.write_all(body.as_bytes())?;
+    }
     stream.flush()
 }
 
@@ -106,6 +192,30 @@ fn render_page(path: &Path) -> String {
     match read_snapshot(path) {
         Ok(snapshot) => page_from(&snapshot, ""),
         Err(message) => page_from(&Snapshot::default(), &message),
+    }
+}
+
+fn render_status_json(path: &Path) -> String {
+    match read_snapshot(path) {
+        Ok(snapshot) => json!({
+            "index_phase": snapshot.index_phase,
+            "watched_count": snapshot.watched_count,
+            "agents": snapshot.agents.iter().map(|(id, name)| json!({"id": id, "name": name})).collect::<Vec<_>>(),
+            "token_counts": snapshot.token_counts.iter().map(|(id, prompt, completion)| json!({"id": id, "prompt": prompt, "completion": completion})).collect::<Vec<_>>(),
+            "approvals": snapshot.approvals.iter().map(|(id, decision, args_hash)| json!({"id": id, "decision": decision, "args_hash": args_hash})).collect::<Vec<_>>(),
+            "evidence": snapshot.evidence.iter().map(|(id, summary)| json!({"id": id, "summary": summary})).collect::<Vec<_>>(),
+        })
+        .to_string(),
+        Err(message) => json!({
+            "error": message,
+            "index_phase": "idle",
+            "watched_count": "0",
+            "agents": [],
+            "token_counts": [],
+            "approvals": [],
+            "evidence": [],
+        })
+        .to_string(),
     }
 }
 
@@ -130,7 +240,25 @@ fn read_snapshot(path: &Path) -> std::result::Result<Snapshot, String> {
     if meta.permissions().mode() & 0o077 != 0 {
         return Err("status file is not private".into());
     }
-    let text = fs::read_to_string(path).map_err(|_| "status file is unreadable".to_string())?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| "status file is unreadable".to_string())?;
+    let opened = file
+        .metadata()
+        .map_err(|_| "status file is unreadable".to_string())?;
+    if !opened.is_file()
+        || opened.dev() != meta.dev()
+        || opened.ino() != meta.ino()
+        || (opened.permissions().mode() & 0o077 != 0)
+    {
+        return Err("status file is not private".into());
+    }
+    let mut text = String::new();
+    file.take(MAX_STATUS_FILE_BYTES)
+        .read_to_string(&mut text)
+        .map_err(|_| "status file is unreadable".to_string())?;
     let value: Value =
         serde_json::from_str(&text).map_err(|_| "status file is not json".to_string())?;
     Ok(snapshot_from(&value))

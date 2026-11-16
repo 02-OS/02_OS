@@ -13,7 +13,15 @@ export function matchingApproval(approvals, typed) {
     const needle = `${typed ?? ''}`.trim().toLowerCase();
     if (!/^[0-9a-f]{64}$/.test(needle))
         return null;
-    return (approvals ?? []).find(row => `${row.args_hash ?? ''}`.toLowerCase() === needle) ?? null;
+    const rows = Array.isArray(approvals) ? approvals : [];
+    return rows.find(row => row.decision === 'pending' && `${row.args_hash ?? ''}`.toLowerCase() === needle)
+        ?? rows.find(row => `${row.args_hash ?? ''}`.toLowerCase() === needle)
+        ?? null;
+}
+
+export function pendingApprovalCount(approvals) {
+    const rows = Array.isArray(approvals) ? approvals : [];
+    return rows.filter(row => row && (row.decision === 'pending' || row.decision === 'ask')).length;
 }
 
 function dataHome() {
@@ -27,17 +35,13 @@ function statusPath() {
 
 function socketPath() {
     const runtime = GLib.getenv('XDG_RUNTIME_DIR');
-    if (runtime)
+    if (runtime && runtime.startsWith('/'))
         return GLib.build_filenamev([runtime, '02agent.sock']);
     return GLib.build_filenamev([dataHome(), '02-agent', '02agent.sock']);
 }
 
-function readStatus() {
+function parseStatusBytes(bytes) {
     try {
-        const file = Gio.File.new_for_path(statusPath());
-        const [ok, bytes] = file.load_contents(null);
-        if (!ok)
-            return EMPTY;
         const parsed = JSON.parse(new TextDecoder().decode(bytes));
         return {
             index_phase: `${parsed.index_phase ?? 'idle'}`,
@@ -49,32 +53,94 @@ function readStatus() {
     }
 }
 
-function sendDecide(row, decision, typed) {
-    const client = new Gio.SocketClient();
-    const address = new Gio.UnixSocketAddress({ path: socketPath() });
-    const connection = client.connect(address, null);
-    const payload = {
+function readStatusAsync(cancellable, callback) {
+    try {
+        const file = Gio.File.new_for_path(statusPath());
+        if (typeof file.load_contents_async === 'function') {
+            file.load_contents_async(cancellable, (source, res) => {
+                try {
+                    const [ok, bytes] = source.load_contents_finish(res);
+                    callback(ok ? parseStatusBytes(bytes) : EMPTY);
+                } catch (_error) {
+                    callback(EMPTY);
+                }
+            });
+            return;
+        }
+        const [ok, bytes] = file.load_contents(cancellable);
+        callback(ok ? parseStatusBytes(bytes) : EMPTY);
+    } catch (_error) {
+        callback(EMPTY);
+    }
+}
+
+export function buildDecidePayload(row, decision, typed) {
+    const normalizedHash = `${typed ?? ''}`.trim().toLowerCase();
+    return {
         jsonrpc: '2.0',
         id: 1,
         method: 'daemon/decide',
         params: {
             repo_path: row.repo_path,
             id: `gnome-${GLib.get_real_time()}`,
+            pending_id: row.id ?? '',
+            confirmation_nonce: row.confirmation_nonce ?? '',
             agt_run_id: row.run_id ?? '',
             agt_command_id: row.command_id ?? '',
             args_hash: row.args_hash,
-            confirmed_hash: typed.trim(),
+            confirmed_hash: normalizedHash,
             decision,
             approver: 'desktop-user',
             invoker: 'agent',
         },
     };
-    const bytes = new TextEncoder().encode(`${JSON.stringify(payload)}\n`);
-    connection.get_output_stream().write_all(bytes, null);
-    const input = new Gio.DataInputStream({ base_stream: connection.get_input_stream() });
-    const [reply] = input.read_line_utf8(null);
-    connection.close(null);
-    return reply ? JSON.parse(reply) : null;
+}
+
+function sendDecideAsync(row, decision, typed, cancellable, callback) {
+    try {
+        const client = new Gio.SocketClient();
+        const address = new Gio.UnixSocketAddress({ path: socketPath() });
+        const payload = buildDecidePayload(row, decision, typed);
+        const bytes = new TextEncoder().encode(`${JSON.stringify(payload)}\n`);
+
+        if (typeof client.connect_async === 'function') {
+            client.connect_async(address, cancellable, (src, res) => {
+                try {
+                    const connection = src.connect_finish(res);
+                    connection.get_output_stream().write_all(bytes, cancellable);
+                    const input = new Gio.DataInputStream({ base_stream: connection.get_input_stream() });
+                    if (typeof input.read_line_async === 'function') {
+                        input.read_line_async(GLib.PRIORITY_DEFAULT, cancellable, (inStream, readRes) => {
+                            try {
+                                const [reply] = inStream.read_line_finish_utf8(readRes);
+                                connection.close(null);
+                                callback(reply ? JSON.parse(reply) : null, null);
+                            } catch (err) {
+                                try { connection.close(null); } catch (_e) {}
+                                callback(null, err);
+                            }
+                        });
+                        return;
+                    }
+                    const [reply] = input.read_line_utf8(cancellable);
+                    connection.close(null);
+                    callback(reply ? JSON.parse(reply) : null, null);
+                } catch (err) {
+                    callback(null, err);
+                }
+            });
+            return;
+        }
+
+        const connection = client.connect(address, cancellable);
+        connection.get_output_stream().write_all(bytes, cancellable);
+        const input = new Gio.DataInputStream({ base_stream: connection.get_input_stream() });
+        const [reply] = input.read_line_utf8(cancellable);
+        connection.close(null);
+        callback(reply ? JSON.parse(reply) : null, null);
+    } catch (err) {
+        callback(null, err);
+    }
 }
 
 export default class AgentStatusExtension extends Extension {
@@ -82,19 +148,25 @@ export default class AgentStatusExtension extends Extension {
         this._status = EMPTY;
         this._seenPhase = null;
         this._seenIds = new Set();
+        this._rows = [];
+        this._cancellable = new Gio.Cancellable();
         this._settings = null;
+        this._settingsChangedIds = [];
         try {
             this._settings = this.getSettings();
         } catch (_error) {
             this._settings = null;
         }
 
-        this._button = new PanelMenu.Button(0.0, '02 agent status', true);
+        this._button = new PanelMenu.Button(0.0, '02 agent status', false);
         this._label = new St.Label({
             text: '02 agent: idle',
             style_class: '02-agent-status',
         });
         this._button.add_child(this._label);
+
+        this._approvalsSection = new PopupMenu.PopupMenuSection();
+        this._button.menu.addMenuItem(this._approvalsSection);
 
         this._entryItem = new PopupMenu.PopupBaseMenuItem({ reactive: false });
         this._entry = new St.Entry({
@@ -111,13 +183,16 @@ export default class AgentStatusExtension extends Extension {
         this._deny = this._button.menu.addAction('Deny confirmed hash', () => this._decide('deny'));
         this._button.menu.addAction('Stop desktop automation', () => this._stopDesktop());
 
+        if (this._settings && typeof this._settings.connect === 'function') {
+            this._settingsChangedIds.push(
+                this._settings.connect('changed::poll-seconds', () => this._reschedulePoll()),
+                this._settings.connect('changed::notifications', () => this._refresh()),
+            );
+        }
+
         Main.panel.addToStatusArea('02-agent-status', this._button);
         this._refresh();
-        const seconds = this._settings?.get_int('poll-seconds') || 15;
-        this._timeout = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, seconds, () => {
-            this._refresh();
-            return GLib.SOURCE_CONTINUE;
-        });
+        this._reschedulePoll();
     }
 
     disable() {
@@ -125,13 +200,46 @@ export default class AgentStatusExtension extends Extension {
             GLib.source_remove(this._timeout);
             this._timeout = 0;
         }
+        if (this._cancellable) {
+            this._cancellable.cancel();
+            this._cancellable = null;
+        }
+        if (this._settings && Array.isArray(this._settingsChangedIds)) {
+            for (const handlerId of this._settingsChangedIds) {
+                try {
+                    this._settings.disconnect(handlerId);
+                } catch (_error) {}
+            }
+        }
+        this._settingsChangedIds = [];
+        for (const item of this._rows ?? [])
+            item.destroy();
+        this._rows = [];
+        this._approvalsSection = null;
+        this._entryItem = null;
+        this._allow = null;
+        this._deny = null;
         this._button?.destroy();
         this._button = null;
         this._label = null;
         this._entry = null;
         this._status = EMPTY;
+        this._seenPhase = null;
         this._seenIds = null;
         this._settings = null;
+    }
+
+    _reschedulePoll() {
+        if (this._timeout) {
+            GLib.source_remove(this._timeout);
+            this._timeout = 0;
+        }
+        const rawSeconds = this._settings?.get_int('poll-seconds') || 15;
+        const seconds = Math.max(5, Math.min(120, rawSeconds));
+        this._timeout = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, seconds, () => {
+            this._refresh();
+            return GLib.SOURCE_CONTINUE;
+        });
     }
 
     _notify(body) {
@@ -141,23 +249,28 @@ export default class AgentStatusExtension extends Extension {
     }
 
     _refresh() {
-        const next = readStatus();
-        const phase = next.index_phase || 'idle';
-        const count = next.approvals.length;
-        this._label?.set_text(`02 agent: ${phase} · ${next.watched_count} repos · ${count} approvals`);
+        readStatusAsync(this._cancellable, next => {
+            if (!this._button)
+                return;
+            const phase = next.index_phase || 'idle';
+            const count = next.approvals.length;
+            const pending = pendingApprovalCount(next.approvals);
+            const badge = pending > 0 ? ` · [${pending} pending]` : '';
+            this._label?.set_text(`02 agent: ${phase} · ${next.watched_count} repos · ${count} approvals${badge}`);
 
-        if (this._seenPhase !== null && this._seenPhase !== phase)
-            this._notify(`Index phase is ${phase}`);
-        if (this._seenPhase !== null) {
-            for (const row of next.approvals) {
-                if (row.id && !this._seenIds.has(row.id))
-                    this._notify(`Approval ${row.command_id || row.id} is ${row.decision}`);
+            if (this._seenPhase !== null && this._seenPhase !== phase)
+                this._notify(`Index phase is ${phase}`);
+            if (this._seenPhase !== null && this._seenIds) {
+                for (const row of next.approvals) {
+                    if (row.id && !this._seenIds.has(row.id))
+                        this._notify(`Approval ${row.command_id || row.id} is ${row.decision}`);
+                }
             }
-        }
-        this._seenPhase = phase;
-        this._seenIds = new Set(next.approvals.map(row => row.id).filter(Boolean));
-        this._status = next;
-        this._rebuildMenu(next.approvals);
+            this._seenPhase = phase;
+            this._seenIds = new Set(next.approvals.map(row => row.id).filter(Boolean));
+            this._status = next;
+            this._rebuildMenu(next.approvals);
+        });
     }
 
     _rebuildMenu(approvals) {
@@ -170,7 +283,10 @@ export default class AgentStatusExtension extends Extension {
                 ? `${row.command_id || row.id} · ${row.args_hash} · ${row.decision}`
                 : 'No stored approvals';
             const item = new PopupMenu.PopupMenuItem(label);
-            this._button.menu.addMenuItem(item, 0);
+            if (this._approvalsSection)
+                this._approvalsSection.addMenuItem(item);
+            else
+                this._button.menu.addMenuItem(item);
             this._rows.push(item);
         }
     }
@@ -183,6 +299,25 @@ export default class AgentStatusExtension extends Extension {
             GLib.mkdir_with_parents(dir, 0o700);
             const path = GLib.build_filenamev([dir, 'desktop-kill']);
             const file = Gio.File.new_for_path(path);
+            const bytes = new TextEncoder().encode('stop\n');
+            if (typeof file.replace_contents_bytes_async === 'function') {
+                file.replace_contents_bytes_async(
+                    new GLib.Bytes(bytes),
+                    null,
+                    false,
+                    Gio.FileCreateFlags.PRIVATE,
+                    this._cancellable,
+                    (src, res) => {
+                        try {
+                            src.replace_contents_finish(res);
+                            this._notify('Desktop automation is stopped');
+                        } catch (_error) {
+                            this._notify('Could not write the desktop kill switch');
+                        }
+                    },
+                );
+                return;
+            }
             file.replace_contents('stop\n', null, false, Gio.FileCreateFlags.PRIVATE, null);
             this._notify('Desktop automation is stopped');
         } catch (_error) {
@@ -197,15 +332,16 @@ export default class AgentStatusExtension extends Extension {
             this._notify('Type the displayed args hash before deciding');
             return;
         }
-        try {
-            const reply = sendDecide(row, decision, typed);
+        sendDecideAsync(row, decision, typed, this._cancellable, (reply, err) => {
+            if (err) {
+                this._notify('02-agentd is not running');
+                return;
+            }
             if (reply?.error)
                 this._notify(reply.error.message || 'Decision was rejected');
             else
                 this._notify(`Recorded a ${decision} from the desktop`);
-        } catch (_error) {
-            this._notify('02-agentd is not running');
-        }
-        this._refresh();
+            this._refresh();
+        });
     }
 }

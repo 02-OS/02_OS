@@ -224,6 +224,24 @@ impl GitRepo {
         }
     }
 
+    /// Map relative tracked stage-0 paths to their Git blob OID strings in one index open.
+    pub fn list_blob_ids(&self) -> Result<std::collections::HashMap<String, String>> {
+        let index = self
+            .repo
+            .index()
+            .map_err(|e| AgentError::Git(format!("Failed to get index: {}", e)))?;
+        let mut blobs = std::collections::HashMap::with_capacity(index.len());
+        for entry in index.iter() {
+            if ((entry.flags >> 12) & 0x3) != 0 {
+                continue;
+            }
+            if let Ok(path) = std::str::from_utf8(&entry.path) {
+                blobs.insert(path.to_string(), entry.id.to_string());
+            }
+        }
+        Ok(blobs)
+    }
+
     /// Read a regular UTF-8 evidence blob at an exact commit, with a size cap.
     pub fn read_text_at_commit(
         &self,
@@ -294,23 +312,7 @@ impl GitRepo {
                 Err(_) => continue,
             };
             if let Ok(commit) = self.repo.find_commit(oid) {
-                let summary = commit.summary().unwrap_or("").to_string();
-                let author = commit.author().name().unwrap_or("Unknown").to_string();
-                let timestamp = commit.time().seconds();
-                let hex = oid.to_string();
-                let short_id = if hex.len() >= 7 {
-                    hex[..7].to_string()
-                } else {
-                    hex.clone()
-                };
-
-                commits.push(GitCommitInfo {
-                    id: hex,
-                    short_id,
-                    summary,
-                    author,
-                    timestamp,
-                });
+                commits.push(commit_to_info(&commit));
             }
         }
 
@@ -451,42 +453,67 @@ impl GitRepo {
             .repo
             .find_commit(oid)
             .map_err(|err| AgentError::Git(format!("Commit not found: {err}")))?;
-        let hex = oid.to_string();
-        let short_id = if hex.len() >= 7 {
-            hex[..7].to_string()
-        } else {
-            hex.clone()
-        };
-        let summary = commit.summary().unwrap_or("").to_string();
-        let author = commit.author().name().unwrap_or("Unknown").to_string();
-        let timestamp = commit.time().seconds();
-        Ok(GitCommitInfo {
-            id: hex,
-            short_id,
-            summary,
-            author,
-            timestamp,
-        })
+        Ok(commit_to_info(&commit))
     }
 
-    /// Recent commits whose diff touches `relative_path`.
+    /// Recent commits whose tree entry for `relative_path` differs from their first parent.
     pub fn commits_touching(
         &self,
         relative_path: &str,
         limit: usize,
     ) -> Result<Vec<GitCommitInfo>> {
-        let recent = self.get_recent_commits(200)?;
+        if limit == 0 || relative_path.is_empty() {
+            return Ok(Vec::new());
+        }
+        let target = Path::new(relative_path);
+        let mut revwalk = match self.repo.revwalk() {
+            Ok(r) => r,
+            Err(_) => return Ok(Vec::new()),
+        };
+        if revwalk.push_head().is_err() {
+            return Ok(Vec::new());
+        }
+
         let mut matched = Vec::new();
-        for commit in recent {
+        for id in revwalk.take(200) {
             if matched.len() >= limit {
                 break;
             }
-            let paths = self.paths_touched_by_commit(&commit.id)?;
-            if paths.iter().any(|path| path == relative_path) {
-                matched.push(commit);
+            let Ok(oid) = id else {
+                continue;
+            };
+            let Ok(commit) = self.repo.find_commit(oid) else {
+                continue;
+            };
+            let Ok(tree) = commit.tree() else {
+                continue;
+            };
+            let cur_entry = tree.get_path(target).ok().map(|e| (e.id(), e.filemode()));
+            let old_entry = commit
+                .parent(0)
+                .ok()
+                .and_then(|parent| parent.tree().ok())
+                .and_then(|ptree| ptree.get_path(target).ok().map(|e| (e.id(), e.filemode())));
+            if cur_entry != old_entry {
+                matched.push(commit_to_info(&commit));
             }
         }
         Ok(matched)
+    }
+}
+
+fn commit_to_info(commit: &git2::Commit<'_>) -> GitCommitInfo {
+    let hex = commit.id().to_string();
+    let short_id = hex.chars().take(7).collect();
+    let summary = commit.summary().unwrap_or("").to_string();
+    let author = commit.author().name().unwrap_or("Unknown").to_string();
+    let timestamp = commit.time().seconds();
+    GitCommitInfo {
+        id: hex,
+        short_id,
+        summary,
+        author,
+        timestamp,
     }
 }
 

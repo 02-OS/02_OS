@@ -1,4 +1,5 @@
 use agent_core::{
+    contain::write_private_atomic,
     paths::StoragePaths,
     types::{
         EvidenceItem, EvidenceMemory, MemoryKind, MemoryStatus, RepoId, RepoInfo, SecretPattern,
@@ -6,6 +7,7 @@ use agent_core::{
     AgentError, Result,
 };
 use chrono::Utc;
+use std::borrow::Cow;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -27,6 +29,7 @@ impl MemoryStore {
     }
 
     /// Load all evidence memories from memories.jsonl.
+    /// Fails closed on malformed JSONL lines instead of silently dropping records.
     pub fn load_all(&self) -> Result<Vec<EvidenceMemory>> {
         if !self.path.exists() {
             return Ok(Vec::new());
@@ -36,16 +39,23 @@ impl MemoryStore {
         let reader = BufReader::new(file);
         let mut memories = Vec::new();
 
-        for line in reader.lines() {
+        for (index, line) in reader.lines().enumerate() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
-            if let Ok(mut mem) = serde_json::from_str::<EvidenceMemory>(&line) {
-                // Older stores may contain raw claims. Never expose those through any reader.
-                mem.claim = SecretPattern::redact(&mem.claim);
-                memories.push(mem);
+            let mut mem: EvidenceMemory = serde_json::from_str(&line).map_err(|err| {
+                AgentError::General(format!(
+                    "malformed memory record on line {} of {}: {err}",
+                    index + 1,
+                    self.path.display()
+                ))
+            })?;
+            // Older stores may contain raw claims. Never expose those through any reader.
+            if let Cow::Owned(redacted) = SecretPattern::redact_cow(&mem.claim) {
+                mem.claim = redacted;
             }
+            memories.push(mem);
         }
 
         Ok(memories)
@@ -123,29 +133,16 @@ impl MemoryStore {
     }
 
     fn write_all(&self, memories: &[EvidenceMemory]) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let temp_path = self.path.with_extension("jsonl.tmp");
-        {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&temp_path)?;
-
-            for mem in memories {
-                let mut sanitized = mem.clone();
-                sanitized.claim = SecretPattern::redact(&sanitized.claim);
-                let serialized = serde_json::to_string(&sanitized)?;
-                writeln!(file, "{}", serialized)?;
+        let mut buffer = Vec::new();
+        for mem in memories {
+            let mut sanitized = mem.clone();
+            if let Cow::Owned(redacted) = SecretPattern::redact_cow(&sanitized.claim) {
+                sanitized.claim = redacted;
             }
-            file.flush()?;
+            serde_json::to_writer(&mut buffer, &sanitized)?;
+            buffer.write_all(b"\n")?;
         }
-
-        fs::rename(temp_path, &self.path)?;
-        Ok(())
+        write_private_atomic(&self.path, &buffer)
     }
 
     /// Automatically discover foundational architectural facts if memories are currently empty.

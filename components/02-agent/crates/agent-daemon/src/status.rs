@@ -1,12 +1,12 @@
 use agent_core::{
-    error::AgentError, paths::StoragePaths, phase::phase_label, types::RepoId, Result,
+    contain::write_private_atomic, error::AgentError, paths::StoragePaths, phase::phase_label,
+    types::RepoId, Result,
 };
 use agent_git::GitRepo;
-use agent_index::{ApprovalRequest, IndexDatabase, StoredApproval};
+use agent_index::{ApprovalRequest, IndexDatabase, PendingConfirmation, StoredApproval};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// Local snapshot the Shell extension reads. It contains no tool arguments.
@@ -19,31 +19,53 @@ pub struct StatusApproval {
     pub decision: String,
     pub repo_id: String,
     pub repo_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation_nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusAgent {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusTokenCount {
+    pub id: String,
+    #[serde(default)]
+    pub prompt: u64,
+    #[serde(default)]
+    pub completion: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusEvidence {
+    pub id: String,
+    pub summary: String,
+    #[serde(default)]
+    pub package_digest: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusReport {
     pub index_phase: String,
     pub watched_count: usize,
     pub approvals: Vec<StatusApproval>,
+    #[serde(default)]
+    pub agents: Vec<StatusAgent>,
+    #[serde(default)]
+    pub token_counts: Vec<StatusTokenCount>,
+    #[serde(default)]
+    pub evidence: Vec<StatusEvidence>,
 }
 
-/// Write `status.json` for the session extension. Mode `0600`, replaced atomically.
+/// Write `status.json` for the session extension. Mode `0600`, replaced atomically (`#133`).
 pub fn write_status_file(path: &Path, report: &StatusReport) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            StoragePaths::ensure_private_dir(parent)?;
-        }
-    }
     let body = serde_json::to_vec_pretty(report)
         .map_err(|err| AgentError::General(format!("status json failed: {err}")))?;
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, body)?;
-    let mut permissions = fs::metadata(&temporary)?.permissions();
-    permissions.set_mode(0o600);
-    fs::set_permissions(&temporary, permissions)?;
-    fs::rename(&temporary, path)?;
-    Ok(())
+    write_private_atomic(path, &body)
 }
 
 fn read_phase(status_path: &Path) -> String {
@@ -66,9 +88,13 @@ fn existing_index_db(repo_id: &RepoId) -> Result<Option<IndexDatabase>> {
     Ok(Some(IndexDatabase::open(&path)?))
 }
 
-/// Build the snapshot from the phase file and approval rows already stored.
+/// Build the snapshot from the phase file and v5 telemetry rows (`#144`, `#153`).
 pub fn publish_status_snapshot(status_path: &Path, watched: &[PathBuf]) -> Result<StatusReport> {
     let mut approvals = Vec::new();
+    let mut agents = Vec::new();
+    let mut token_counts = Vec::new();
+    let mut evidence = Vec::new();
+
     for path in watched {
         let Ok(repo) = GitRepo::open(path) else {
             continue;
@@ -79,20 +105,67 @@ pub fn publish_status_snapshot(status_path: &Path, watched: &[PathBuf]) -> Resul
         let Ok(Some(db)) = existing_index_db(&info.id) else {
             continue;
         };
-        let Ok(rows) = db.list_approvals(&info.id) else {
-            continue;
-        };
-        for row in rows {
-            approvals.push(view_row(&info.id, path, row));
+        if let Ok(pending_rows) = db.list_pending_confirmations(&info.id) {
+            for pending in pending_rows {
+                approvals.push(view_pending(&info.id, path, pending));
+            }
+        }
+        if let Ok(rows) = db.list_approvals(&info.id) {
+            for row in rows {
+                approvals.push(view_row(&info.id, path, row));
+            }
+        }
+        if let Ok(actor_rows) = db.list_actors(&info.id) {
+            for actor in actor_rows {
+                agents.push(StatusAgent {
+                    id: actor.id,
+                    name: actor.display_name,
+                    kind: actor.kind,
+                });
+            }
+        }
+        if let Ok(token_rows) = db.list_token_counts(&info.id) {
+            for tc in token_rows {
+                token_counts.push(StatusTokenCount {
+                    id: tc.tool,
+                    prompt: tc.total_tokens,
+                    completion: tc.invocations as u64,
+                });
+            }
+        }
+        if let Ok(ev_rows) = db.list_evidence_summaries(&info.id) {
+            for ev in ev_rows {
+                evidence.push(StatusEvidence {
+                    id: ev.id,
+                    summary: format!("{} ({})", ev.task_type, ev.outcome),
+                    package_digest: ev.package_digest,
+                });
+            }
         }
     }
     let report = StatusReport {
         index_phase: read_phase(status_path),
         watched_count: watched.len(),
         approvals,
+        agents,
+        token_counts,
+        evidence,
     };
     write_status_file(status_path, &report)?;
     Ok(report)
+}
+
+fn view_pending(repo_id: &RepoId, path: &Path, pending: PendingConfirmation) -> StatusApproval {
+    StatusApproval {
+        id: pending.id,
+        run_id: None,
+        command_id: Some(pending.tool),
+        args_hash: pending.args_hash,
+        decision: "pending".to_string(),
+        repo_id: repo_id.as_str().to_string(),
+        repo_path: path.display().to_string(),
+        confirmation_nonce: Some(pending.nonce),
+    }
 }
 
 fn view_row(repo_id: &RepoId, path: &Path, row: StoredApproval) -> StatusApproval {
@@ -104,6 +177,7 @@ fn view_row(repo_id: &RepoId, path: &Path, row: StoredApproval) -> StatusApprova
         decision: row.decision,
         repo_id: repo_id.as_str().to_string(),
         repo_path: path.display().to_string(),
+        confirmation_nonce: None,
     }
 }
 
@@ -122,6 +196,14 @@ pub fn approval_from_confirmation(params: &Value) -> Result<ApprovalRequest> {
         return Err(AgentError::Security(
             "confirmed hash does not match the displayed args hash".into(),
         ));
+    }
+    if let Some(expected_nonce) = optional_text(params, "expected_nonce") {
+        let presented_nonce = text_field(params, "confirmation_nonce");
+        if !agent_skills::constant_time_eq(expected_nonce.as_bytes(), presented_nonce.as_bytes()) {
+            return Err(AgentError::Security(
+                "confirmation nonce does not match the pending approval".into(),
+            ));
+        }
     }
     let request = ApprovalRequest {
         id: text_field(params, "id"),
@@ -160,7 +242,11 @@ fn optional_text(params: &Value, key: &str) -> Option<String> {
     }
 }
 
-/// Record a confirmed gnome decision against an indexed repository.
+/// Record a confirmed gnome decision against an indexed repository (`#132`).
+///
+/// Requires an open pending invocation in `tool_invocations` bound to a matching
+/// daemon-issued `confirmation_nonce`, consuming the pending invocation atomically
+/// so arbitrary socket callers cannot mint approvals without a live challenge.
 pub fn apply_gnome_decision(params: &Value) -> Result<String> {
     let request = approval_from_confirmation(params)?;
     let repo_path = text_field(params, "repo_path");
@@ -169,10 +255,36 @@ pub fn apply_gnome_decision(params: &Value) -> Result<String> {
             "gnome decision requires repo_path".into(),
         ));
     }
+    let confirmation_nonce = text_field(params, "confirmation_nonce");
+    if confirmation_nonce.is_empty() {
+        return Err(AgentError::Security(
+            "gnome decision requires a daemon-issued confirmation_nonce".into(),
+        ));
+    }
     let info = GitRepo::open(&repo_path)?.info()?;
     let Some(db) = existing_index_db(&info.id)? else {
         return Err(AgentError::RepositoryNotInitialized);
     };
+    let explicit_pending_id = optional_text(params, "pending_id");
+    let pending_id = match explicit_pending_id {
+        Some(pid) => pid,
+        None => {
+            let pending_list = db.list_pending_confirmations(&info.id)?;
+            pending_list
+                .into_iter()
+                .find(|p| {
+                    p.id == request.id || p.args_hash.eq_ignore_ascii_case(&request.args_hash)
+                })
+                .map(|p| p.id)
+                .unwrap_or_else(|| request.id.clone())
+        }
+    };
+    db.verify_and_consume_pending_confirmation(
+        &pending_id,
+        &request.args_hash,
+        &confirmation_nonce,
+        &request.decision,
+    )?;
     let id = request.id.clone();
     db.record_approval(&info.id, &request)?;
     Ok(id)
@@ -236,6 +348,7 @@ mod tests {
             index_phase: "indexing".into(),
             watched_count: 2,
             approvals: Vec::new(),
+            ..Default::default()
         };
         write_status_file(&path, &report).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;

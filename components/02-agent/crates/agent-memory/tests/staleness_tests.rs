@@ -649,3 +649,43 @@ fn missing_tsx_symbol_stays_stale_after_a_clean_reindex() {
         MemoryStatus::Fresh
     );
 }
+
+#[test]
+fn same_named_methods_in_one_file_do_not_collide_in_staleness() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let repo = Repository::init(root).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/pair.rs"),
+        "pub struct A;\npub struct B;\nimpl A { pub fn build() -> i32 { 1 } }\nimpl B { pub fn build() -> i32 { 2 } }\n",
+    )
+    .unwrap();
+    commit_paths(&repo, "init", &["src/pair.rs"]);
+
+    let repo_id = RepoId::from_path(root);
+    let mut db = IndexDatabase::open_in_memory().unwrap();
+    db.update_repo_info(&agent_core::types::RepoInfo {
+        id: repo_id.clone(),
+        name: "pair".into(),
+        root_path: root.to_path_buf(),
+        head_commit: None,
+        branch: Some("master".into()),
+        is_clean: true,
+        modified_count: 0,
+        untracked_count: 0,
+    })
+    .unwrap();
+    index_symbols(root, &repo_id, &mut db);
+
+    // Edit only B::build while leaving A::build untouched.
+    fs::write(
+        root.join("src/pair.rs"),
+        "pub struct A;\npub struct B;\nimpl A { pub fn build() -> i32 { 1 } }\nimpl B { pub fn build() -> i32 { 99 } }\n",
+    )
+    .unwrap();
+    let store = MemoryStore::new(root.join("memories.jsonl"));
+    let git_repo = GitRepo::open(root).unwrap();
+    let report = StalenessEngine::evaluate(root, &repo_id, &git_repo, &db, &store).unwrap();
+    assert!(report.changed_symbols.contains(&"build".to_string()));
+}

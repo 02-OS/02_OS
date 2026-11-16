@@ -299,4 +299,119 @@ fn test_gc_drops_orphan_directories_and_old_versions() {
     let points = live.list_datapoints(&dataset.id).unwrap();
     assert_eq!(points.len(), 3);
     assert!(points.iter().all(|point| point.kind == "pasted_text"));
+
+    // Non-empty orphan directory without index.sqlite should also be reclaimed.
+    let stale_non_empty = data.path().join("repos").join("stale-orphan");
+    fs::create_dir_all(&stale_non_empty).unwrap();
+    fs::write(stale_non_empty.join("partial.tmp"), b"incomplete").unwrap();
+    let report2 = gc_repos(data.path()).unwrap();
+    assert_eq!(report2.orphan_directories, 1);
+    assert!(!stale_non_empty.exists());
+}
+
+#[test]
+fn scanner_fingerprint_matches_scan_fingerprint_and_v5_columns_populate() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        format!(
+            "pub fn a() {{}}\npub fn b() {{ let _k = \"ghp_{}\"; }}\n",
+            "z".repeat(36)
+        ),
+    )
+    .unwrap();
+
+    let cfg = agent_core::RepoConfig::default();
+    let scanner = RepoScanner::new(root, cfg.clone());
+    let scanned = scanner.scan();
+    assert_eq!(
+        scanner.fingerprint(),
+        RepoScanner::scan_fingerprint(&scanned, &cfg)
+    );
+
+    let repo_id = RepoId::from_path(root);
+    let mut db = IndexDatabase::open_in_memory().unwrap();
+    db.update_repo_info(&RepoInfo {
+        id: repo_id.clone(),
+        name: "fp-test".into(),
+        root_path: root.to_path_buf(),
+        head_commit: None,
+        branch: None,
+        is_clean: true,
+        modified_count: 0,
+        untracked_count: 0,
+    })
+    .unwrap();
+
+    let sym = sample_symbol("a", "src/lib.rs::a");
+    db.update_incremental(&repo_id, &scanned, &[], &[sym], &[], None)
+        .unwrap();
+    let stats = db.get_stats(&repo_id).unwrap();
+    assert_eq!(stats.total_files, 1);
+    assert_eq!(stats.source_files, 1);
+    assert_eq!(stats.total_symbols, 1);
+
+    let deps = db.find_symbol_deps(&repo_id, "a").unwrap();
+    assert_eq!(deps.defined_in.len(), 1);
+}
+
+#[test]
+fn pending_confirmation_nonce_and_v5_telemetry_work() {
+    let dir = tempdir().unwrap();
+    let mut db = IndexDatabase::open(dir.path().join("index.sqlite")).unwrap();
+    let repo_id = RepoId::new("tel");
+    db.update_repo_info(&RepoInfo {
+        id: repo_id.clone(),
+        name: "tel".into(),
+        root_path: dir.path().to_path_buf(),
+        head_commit: None,
+        branch: None,
+        is_clean: true,
+        modified_count: 0,
+        untracked_count: 0,
+    })
+    .unwrap();
+
+    let args_hash = "ab".repeat(32);
+    db.start_pending_invocation(
+        &repo_id,
+        "agt",
+        "agt-worker",
+        "run_tests",
+        &args_hash,
+        "{}",
+        "nonce-1234",
+        "pending-1",
+    )
+    .unwrap();
+    assert_eq!(db.list_pending_confirmations(&repo_id).unwrap().len(), 1);
+    assert!(db
+        .verify_and_consume_pending_confirmation("pending-1", &args_hash, "wrong", "allow")
+        .is_err());
+    let consumed = db
+        .verify_and_consume_pending_confirmation("pending-1", &args_hash, "nonce-1234", "allow")
+        .unwrap();
+    assert_eq!(consumed.tool, "run_tests");
+    assert!(db.list_pending_confirmations(&repo_id).unwrap().is_empty());
+
+    db.record_completed_invocation(
+        &repo_id,
+        "mcp-client",
+        "default",
+        "repository_context",
+        "00",
+        "{}",
+        false,
+        None,
+        Some(512),
+    )
+    .unwrap();
+    assert!(!db.list_actors(&repo_id).unwrap().is_empty());
+    let tokens = db.list_token_counts(&repo_id).unwrap();
+    assert_eq!(tokens.len(), 2);
+    assert!(tokens
+        .iter()
+        .any(|t| t.tool == "repository_context" && t.total_tokens == 512));
 }

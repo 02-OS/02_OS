@@ -88,21 +88,23 @@ impl StalenessEngine {
             let fresh_extraction =
                 CodeExtractor::extract(&file_diff.file_path, &content, lang).ok();
 
+            let old_symbols = db
+                .find_symbols_by_file(repo_id, &file_diff.file_path)
+                .unwrap_or_default();
+
             if let Some(ref fresh) = fresh_extraction {
-                let fresh_names: HashSet<&str> = fresh
+                let fresh_qualified: HashSet<&str> = fresh
                     .symbols
                     .iter()
-                    .map(|symbol| symbol.name.as_str())
+                    .map(|symbol| symbol.qualified_name.as_str())
                     .collect();
-                if let Ok(old_symbols) = db.find_symbols_by_file(repo_id, &file_diff.file_path) {
-                    for old in old_symbols {
-                        if !fresh_names.contains(old.name.as_str()) {
-                            changed_symbols.insert(
-                                &file_diff.file_path,
-                                &old.name,
-                                &old.qualified_name,
-                            );
-                        }
+                for old in &old_symbols {
+                    if !fresh_qualified.contains(old.qualified_name.as_str()) {
+                        changed_symbols.insert(
+                            &file_diff.file_path,
+                            &old.name,
+                            &old.qualified_name,
+                        );
                     }
                 }
             }
@@ -115,9 +117,33 @@ impl StalenessEngine {
                     for sym in &fresh.symbols {
                         // Check if hunk overlaps with symbol line boundaries
                         if sym.start_line <= hunk_range_end && sym.end_line >= hunk_range_start {
-                            // Check if fingerprint changed compared to database record
-                            let existing = db.find_symbols_by_name(repo_id, &sym.name)?;
-                            let matched = existing.iter().find(|e| e.file_path == sym.file_path);
+                            // Match accurately within the same file so same-named methods (e.g. new, fmt) never collide.
+                            let matched = old_symbols
+                                .iter()
+                                .find(|e| e.id == sym.id)
+                                .or_else(|| {
+                                    old_symbols.iter().find(|e| {
+                                        e.file_path == sym.file_path
+                                            && e.qualified_name == sym.qualified_name
+                                            && e.kind == sym.kind
+                                            && e.start_line == sym.start_line
+                                    })
+                                })
+                                .or_else(|| {
+                                    old_symbols.iter().find(|e| {
+                                        e.file_path == sym.file_path
+                                            && e.qualified_name == sym.qualified_name
+                                            && e.kind == sym.kind
+                                    })
+                                })
+                                .or_else(|| {
+                                    old_symbols.iter().find(|e| {
+                                        e.file_path == sym.file_path
+                                            && e.name == sym.name
+                                            && e.kind == sym.kind
+                                            && e.start_line == sym.start_line
+                                    })
+                                });
 
                             if let Some(old) = matched {
                                 if old.fingerprint != sym.fingerprint {

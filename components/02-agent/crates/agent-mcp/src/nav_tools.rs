@@ -1,13 +1,15 @@
 use crate::protocol::{ToolCallResult, ToolDefinition};
+use crate::tools::{apply_policy_to_package, scoped_fact_store};
+use agent_context::types::EvidencePackage;
 use agent_context::{allocate, estimate_tokens, BudgetItem, ContextCompiler};
-use agent_core::{ReferenceKind, RepoId, RepoInfo, SecretPattern};
+use agent_core::{truncate_chars, ReferenceKind, RepoId, RepoInfo, SecretPattern};
 use agent_git::{discover_workspace, GitRepo};
 use agent_index::IndexDatabase;
-use agent_memory::{
-    facts_from_hunks, facts_from_symbols, project_facts, FactStore, DEFAULT_HALF_LIFE_DAYS,
-};
+use agent_memory::{facts_from_hunks, facts_from_symbols, project_facts, DEFAULT_HALF_LIFE_DAYS};
+use agent_skills::SessionPolicy;
 use chrono::Utc;
 use serde_json::{json, Value};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -16,7 +18,11 @@ use std::time::{Duration, Instant};
 /// Tools added for navigation, tests, git, dependencies, ranking, and facts.
 pub fn definitions() -> Vec<ToolDefinition> {
     let specs = [
-        ("list_files", "List indexed files.", "{}"),
+        (
+            "list_files",
+            "List indexed files.",
+            r#"{"limit":{"type":"integer"},"cursor":{"type":"string"}}"#,
+        ),
         (
             "file_outline",
             "List symbols declared in one file.",
@@ -40,9 +46,13 @@ pub fn definitions() -> Vec<ToolDefinition> {
         (
             "references_in_file",
             "List references whose source is a file.",
-            r#"{"path":{"type":"string"}}"#,
+            r#"{"path":{"type":"string"},"limit":{"type":"integer"},"cursor":{"type":"string"}}"#,
         ),
-        ("list_tests", "List indexed test files.", "{}"),
+        (
+            "list_tests",
+            "List indexed test files.",
+            r#"{"limit":{"type":"integer"},"cursor":{"type":"string"}}"#,
+        ),
         (
             "tests_covering",
             "Find tests that cover a symbol.",
@@ -50,7 +60,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
         ),
         (
             "run_tests",
-            "Run one cargo test filter inside the repository. The filter is a single argv token.",
+            "Run one cargo test filter inside the repository. The filter is passed after '--'.",
             r#"{"filter":{"type":"string"}}"#,
         ),
         (
@@ -77,12 +87,12 @@ pub fn definitions() -> Vec<ToolDefinition> {
         (
             "imports_of_file",
             "List import edges declared in a file.",
-            r#"{"path":{"type":"string"}}"#,
+            r#"{"path":{"type":"string"},"limit":{"type":"integer"},"cursor":{"type":"string"}}"#,
         ),
         (
             "importers_of_file",
             "List files that import a file's stem or path.",
-            r#"{"path":{"type":"string"}}"#,
+            r#"{"path":{"type":"string"},"limit":{"type":"integer"},"cursor":{"type":"string"}}"#,
         ),
         (
             "callers_of_symbol",
@@ -133,6 +143,11 @@ pub fn definitions() -> Vec<ToolDefinition> {
             "workspace_search",
             "Search each indexed repository in the workspace.",
             r#"{"query":{"type":"string"},"limit":{"type":"integer"}}"#,
+        ),
+        (
+            "workspace_symbols",
+            "Search or browse indexed symbols across workspace repositories.",
+            r#"{"query":{"type":"string"},"limit":{"type":"integer"},"cursor":{"type":"string"}}"#,
         ),
         (
             "fact_extract",
@@ -194,14 +209,30 @@ pub fn call(
     repo_info: &RepoInfo,
     arguments: &Value,
 ) -> Option<ToolCallResult> {
+    call_with_policy(
+        name, repo_root, git, db, repo_id, repo_info, arguments, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_with_policy(
+    name: &str,
+    repo_root: &Path,
+    git: &GitRepo,
+    db: &IndexDatabase,
+    repo_id: &RepoId,
+    repo_info: &RepoInfo,
+    arguments: &Value,
+    policy: Option<&SessionPolicy>,
+) -> Option<ToolCallResult> {
     let result = match name {
-        "list_files" => list_files(db, repo_id),
+        "list_files" => list_files(db, repo_id, arguments),
         "file_outline" => file_outline(db, repo_id, arguments),
         "goto_definition" => goto_definition(db, repo_id, arguments),
         "enclosing_symbol" => enclosing_symbol(db, repo_id, arguments),
         "search_symbols" => search_symbols(db, repo_id, arguments),
         "references_in_file" => references_in_file(db, repo_id, arguments),
-        "list_tests" => list_tests(db, repo_id),
+        "list_tests" => list_tests(db, repo_id, arguments),
         "tests_covering" => tests_covering(db, repo_id, arguments),
         "run_tests" => run_tests(repo_root, arguments),
         "git_status" => git_status(repo_info),
@@ -214,16 +245,17 @@ pub fn call(
         "callers_of_symbol" => callers_of_symbol(db, repo_id, arguments),
         "callees_of_symbol" => callees_of_symbol(db, repo_id, arguments),
         "dependency_summary" => dependency_summary(db, repo_id),
-        "context_dump" => context_dump(repo_root, arguments),
+        "context_dump" => context_dump(repo_root, repo_id, arguments, policy),
         "rank_files" => rank_files(repo_root, arguments),
         "score_breakdown" => rank_files(repo_root, arguments),
         "budget_preview" => budget_preview(repo_root, arguments),
-        "evidence_package" => evidence_package(repo_root, arguments),
+        "evidence_package" => evidence_package(repo_root, repo_id, arguments, policy),
         "workspace_repos" => workspace_repos(repo_root),
-        "workspace_search" => workspace_search(repo_root, arguments),
-        "fact_extract" => fact_extract(git, db, repo_id, repo_info),
-        "fact_list" => fact_list(repo_id),
-        "fact_decay" => fact_decay(db, repo_info, arguments),
+        "workspace_search" => workspace_search(repo_root, arguments, policy),
+        "workspace_symbols" => workspace_symbols(repo_root, arguments, policy),
+        "fact_extract" => fact_extract(git, db, repo_id, repo_info, policy),
+        "fact_list" => fact_list(repo_id, arguments, policy),
+        "fact_decay" => fact_decay(db, repo_info, arguments, policy),
         _ => return None,
     };
     Some(result)
@@ -250,19 +282,48 @@ fn limit_of(arguments: &Value, default: usize, max: usize) -> usize {
         .get("limit")
         .and_then(|value| value.as_u64())
         .unwrap_or(default as u64)
-        .min(max as u64) as usize
+        .clamp(1, max as u64) as usize
 }
 
-fn list_files(db: &IndexDatabase, repo_id: &RepoId) -> ToolCallResult {
+fn paginate_vec<T>(
+    items: Vec<T>,
+    arguments: &Value,
+    default_limit: usize,
+    max_limit: usize,
+) -> (Vec<T>, bool, Option<String>) {
+    let limit = limit_of(arguments, default_limit, max_limit);
+    let offset = arguments
+        .get("cursor")
+        .and_then(|value| value.as_str())
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    if offset >= items.len() {
+        return (Vec::new(), false, None);
+    }
+    let end = offset.saturating_add(limit).min(items.len());
+    let truncated = end < items.len();
+    let next_cursor = truncated.then(|| end.to_string());
+    let page = items.into_iter().skip(offset).take(end - offset).collect();
+    (page, truncated, next_cursor)
+}
+
+fn list_files(db: &IndexDatabase, repo_id: &RepoId, arguments: &Value) -> ToolCallResult {
     match db.list_files(repo_id) {
-        Ok(files) => ok(json!({
-            "files": files.iter().take(200).map(|file| json!({
-                "path": file.relative_path,
-                "language": format!("{:?}", file.language).to_lowercase(),
-                "kind": file.kind.to_string(),
-                "is_test": file.is_test
-            })).collect::<Vec<_>>()
-        })),
+        Ok(files) => {
+            let entries: Vec<Value> = files
+                .into_iter()
+                .map(|file| {
+                    json!({
+                        "path": file.relative_path,
+                        "language": format!("{:?}", file.language).to_lowercase(),
+                        "kind": file.kind.to_string(),
+                        "is_test": file.is_test
+                    })
+                })
+                .collect();
+            let (page, truncated, next_cursor) = paginate_vec(entries, arguments, 200, 200);
+            ok(json!({ "files": page, "truncated": truncated, "next_cursor": next_cursor }))
+        }
         Err(err) => fail(err),
     }
 }
@@ -333,19 +394,26 @@ fn references_in_file(db: &IndexDatabase, repo_id: &RepoId, arguments: &Value) -
         Ok(path) => path,
         Err(result) => return result,
     };
-    match db.list_references(repo_id.as_str()) {
-        Ok(references) => ok(json!({
-            "references": references.into_iter().filter(|reference| reference.source_file == path).take(200).collect::<Vec<_>>()
-        })),
+    match db.list_references_in_file(repo_id, path, None) {
+        Ok(references) => {
+            let (page, truncated, next_cursor) = paginate_vec(references, arguments, 200, 200);
+            ok(json!({ "references": page, "truncated": truncated, "next_cursor": next_cursor }))
+        }
         Err(err) => fail(err),
     }
 }
 
-fn list_tests(db: &IndexDatabase, repo_id: &RepoId) -> ToolCallResult {
+fn list_tests(db: &IndexDatabase, repo_id: &RepoId, arguments: &Value) -> ToolCallResult {
     match db.list_files(repo_id) {
-        Ok(files) => ok(json!({
-            "tests": files.into_iter().filter(|file| file.is_test).take(200).map(|file| file.relative_path).collect::<Vec<_>>()
-        })),
+        Ok(files) => {
+            let test_files: Vec<String> = files
+                .into_iter()
+                .filter(|file| file.is_test)
+                .map(|file| file.relative_path)
+                .collect();
+            let (page, truncated, next_cursor) = paginate_vec(test_files, arguments, 200, 200);
+            ok(json!({ "tests": page, "truncated": truncated, "next_cursor": next_cursor }))
+        }
         Err(err) => fail(err),
     }
 }
@@ -368,28 +436,39 @@ fn run_tests(repo_root: &Path, arguments: &Value) -> ToolCallResult {
     };
     if !valid_test_filter(filter) {
         return fail(
-            "test filter must be 1-80 characters of letters, numbers, '_', ':', '-', or '.'",
+            "test filter must be 1-80 non-leading-dash characters of letters, numbers, '_', ':', '-', or '.'",
         );
     }
     if !repo_root.join("Cargo.toml").is_file() {
         return fail("run_tests needs a Cargo.toml at the repository root");
     }
-    let mut child = match Command::new("cargo")
+    let mut command = Command::new("cargo");
+    command
         .arg("test")
         .arg("--offline")
         .arg("--locked")
-        .arg(filter)
         .arg("--")
+        .arg(filter)
         .arg("--test-threads=1")
         .current_dir(repo_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    // Put cargo in its own process group so timeouts kill spawned rustc/test descendants too (#130).
+    // SAFETY: `setpgid(0, 0)` is async-signal-safe in pre_exec before exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => return fail(format!("could not start cargo: {err}")),
     };
+    let pgid = child.id() as libc::pid_t;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let stdout_task = thread::spawn(move || read_capped(stdout, 8_000));
@@ -399,12 +478,27 @@ fn run_tests(repo_root: &Path, arguments: &Value) -> ToolCallResult {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() > Duration::from_secs(20) => {
+                // SAFETY: `pgid` matches the child group created via `setpgid(0, 0)`.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = stdout_task.join();
+                let _ = stderr_task.join();
                 return fail("cargo test exceeded 20 seconds");
             }
             Ok(None) => thread::sleep(Duration::from_millis(40)),
-            Err(err) => return fail(err),
+            Err(err) => {
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_task.join();
+                let _ = stderr_task.join();
+                return fail(err);
+            }
         }
     };
     let stdout = stdout_task.join().unwrap_or_default();
@@ -419,6 +513,7 @@ fn run_tests(repo_root: &Path, arguments: &Value) -> ToolCallResult {
 
 pub fn valid_test_filter(filter: &str) -> bool {
     !filter.is_empty()
+        && !filter.starts_with('-')
         && filter.len() <= 80
         && filter
             .chars()
@@ -530,21 +625,19 @@ fn edges_for_file(
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or(path);
-    match db.list_references(repo_id.as_str()) {
-        Ok(references) => {
-            let matches = references
-                .into_iter()
-                .filter(|reference| reference.kind == ReferenceKind::Imports)
-                .filter(|reference| {
-                    if outgoing {
-                        reference.source_file == path
-                    } else {
-                        reference.target_name == path || reference.target_name == stem
-                    }
-                })
-                .take(200)
-                .collect::<Vec<_>>();
-            ok(json!({ "imports": matches }))
+    let edges = if outgoing {
+        db.list_references_in_file(repo_id, path, Some(ReferenceKind::Imports))
+    } else {
+        db.list_importers_of_file(repo_id, stem).map(|refs| {
+            refs.into_iter()
+                .filter(|reference| reference.target_name == path || reference.target_name == stem)
+                .collect()
+        })
+    };
+    match edges {
+        Ok(matches) => {
+            let (page, truncated, next_cursor) = paginate_vec(matches, arguments, 200, 200);
+            ok(json!({ "imports": page, "truncated": truncated, "next_cursor": next_cursor }))
         }
         Err(err) => fail(err),
     }
@@ -575,27 +668,27 @@ fn symbol_side(
 }
 
 fn dependency_summary(db: &IndexDatabase, repo_id: &RepoId) -> ToolCallResult {
-    match db.list_references(repo_id.as_str()) {
-        Ok(references) => {
-            let mut calls = 0;
-            let mut imports = 0;
-            let mut tests = 0;
-            let mut other = 0;
-            for reference in references {
-                match reference.kind {
-                    ReferenceKind::Calls => calls += 1,
-                    ReferenceKind::Imports => imports += 1,
-                    ReferenceKind::Tests => tests += 1,
-                    _ => other += 1,
-                }
-            }
-            ok(json!({ "calls": calls, "imports": imports, "tests": tests, "other": other }))
-        }
+    match db.reference_summary_by_kind(repo_id) {
+        Ok(summary) => ok(json!({
+            "calls": summary.calls_count,
+            "imports": summary.imports_count,
+            "tests": summary.tests_count,
+            "other": 0,
+            "top_imported": summary.top_imported.into_iter().map(|(target, count)| json!({
+                "target": target,
+                "count": count
+            })).collect::<Vec<_>>()
+        })),
         Err(err) => fail(err),
     }
 }
 
-fn context_dump(repo_root: &Path, arguments: &Value) -> ToolCallResult {
+fn context_dump(
+    repo_root: &Path,
+    repo_id: &RepoId,
+    arguments: &Value,
+    policy: Option<&SessionPolicy>,
+) -> ToolCallResult {
     let task = match required(arguments, "task") {
         Ok(task) => task,
         Err(result) => return result,
@@ -603,12 +696,20 @@ fn context_dump(repo_root: &Path, arguments: &Value) -> ToolCallResult {
     let budget = arguments
         .get("budget")
         .and_then(|value| value.as_u64())
-        .unwrap_or(4000) as usize;
-    match ContextCompiler::compile(repo_root, task, budget.min(100_000)) {
-        Ok(package) => {
+        .unwrap_or(4000)
+        .min(100_000) as usize;
+    match ContextCompiler::compile(repo_root, task, budget) {
+        Ok(mut package) => {
+            apply_policy_to_package(repo_id, policy, &mut package);
             let markdown = package.to_markdown();
-            let markdown = markdown.chars().take(16_000).collect::<String>();
-            ok(json!({ "markdown": markdown, "budget": package.budget }))
+            let char_cap = budget.saturating_mul(4).max(16_000);
+            let truncated_text = truncate_chars(&markdown, char_cap);
+            let truncated = truncated_text.len() < markdown.len();
+            ok(json!({
+                "markdown": truncated_text,
+                "truncated": truncated,
+                "budget": package.budget
+            }))
         }
         Err(err) => fail(err),
     }
@@ -633,7 +734,8 @@ fn budget_preview(repo_root: &Path, arguments: &Value) -> ToolCallResult {
     let budget = arguments
         .get("budget")
         .and_then(|value| value.as_u64())
-        .unwrap_or(2000) as usize;
+        .unwrap_or(2000)
+        .min(100_000) as usize;
     let ranked = match ContextCompiler::rank(repo_root, task) {
         Ok(ranked) => ranked,
         Err(err) => return fail(err),
@@ -646,11 +748,55 @@ fn budget_preview(repo_root: &Path, arguments: &Value) -> ToolCallResult {
             tokens: estimate_tokens(&file.path) + 48,
         })
         .collect();
-    let chosen = allocate(&items, budget.min(100_000), 15);
+    let max_items = (budget / 128).clamp(5, 50);
+    let chosen = allocate(&items, budget, max_items);
     ok(json!({ "budget": budget, "chosen": chosen }))
 }
 
-fn evidence_package(repo_root: &Path, arguments: &Value) -> ToolCallResult {
+fn trim_package_for_json(package: &mut EvidencePackage, max_chars: usize) -> (String, bool) {
+    let payload = package.serialized_payload();
+    if payload.chars().count() <= max_chars {
+        return (payload, false);
+    }
+
+    for idx in (0..package.relevant_files.len()).rev() {
+        if package.relevant_files[idx].snippet.take().is_some() {
+            let next = package.serialized_payload();
+            if next.chars().count() <= max_chars {
+                return (next, true);
+            }
+        }
+    }
+    macro_rules! pop_until_fit {
+        ($vec:expr) => {
+            while !$vec.is_empty() {
+                $vec.pop();
+                package.budget.returned_files = package.relevant_files.len();
+                let next = package.serialized_payload();
+                if next.chars().count() <= max_chars {
+                    return (next, true);
+                }
+            }
+        };
+    }
+    pop_until_fit!(package.diagnostic_memories);
+    pop_until_fit!(package.git_context.recent_commits);
+    pop_until_fit!(package.relevant_files);
+    pop_until_fit!(package.relevant_symbols);
+    pop_until_fit!(package.verified_memories);
+    pop_until_fit!(package.relevant_facts);
+    pop_until_fit!(package.dependencies);
+    pop_until_fit!(package.relevant_tests);
+    package.git_context.modified_files.clear();
+    (package.serialized_payload(), true)
+}
+
+fn evidence_package(
+    repo_root: &Path,
+    repo_id: &RepoId,
+    arguments: &Value,
+    policy: Option<&SessionPolicy>,
+) -> ToolCallResult {
     let task = match required(arguments, "task") {
         Ok(task) => task,
         Err(result) => return result,
@@ -658,12 +804,13 @@ fn evidence_package(repo_root: &Path, arguments: &Value) -> ToolCallResult {
     let budget = arguments
         .get("budget")
         .and_then(|value| value.as_u64())
-        .unwrap_or(4000) as usize;
-    match ContextCompiler::compile(repo_root, task, budget.min(100_000)) {
-        Ok(package) => {
-            let payload = package.serialized_payload();
-            let payload = payload.chars().take(20_000).collect::<String>();
-            ok(json!({ "package": payload }))
+        .unwrap_or(4000)
+        .min(100_000) as usize;
+    match ContextCompiler::compile(repo_root, task, budget) {
+        Ok(mut package) => {
+            apply_policy_to_package(repo_id, policy, &mut package);
+            let (payload, truncated) = trim_package_for_json(&mut package, 20_000);
+            ok(json!({ "package": payload, "truncated": truncated }))
         }
         Err(err) => fail(err),
     }
@@ -681,7 +828,11 @@ fn workspace_repos(repo_root: &Path) -> ToolCallResult {
     }
 }
 
-fn workspace_search(repo_root: &Path, arguments: &Value) -> ToolCallResult {
+fn workspace_search(
+    repo_root: &Path,
+    arguments: &Value,
+    policy: Option<&SessionPolicy>,
+) -> ToolCallResult {
     let query = match required(arguments, "query") {
         Ok(query) => query,
         Err(result) => return result,
@@ -697,6 +848,11 @@ fn workspace_search(repo_root: &Path, arguments: &Value) -> ToolCallResult {
             break;
         }
         let repo_id = RepoId::from_path(&member.root);
+        if let Some(p) = policy {
+            if !p.allows_repository(repo_id.as_str()) {
+                continue;
+            }
+        }
         let Ok(db_path) = agent_core::paths::StoragePaths::repo_db_path(&repo_id) else {
             continue;
         };
@@ -719,11 +875,57 @@ fn workspace_search(repo_root: &Path, arguments: &Value) -> ToolCallResult {
     ok(json!({ "hits": hits }))
 }
 
+fn workspace_symbols(
+    repo_root: &Path,
+    arguments: &Value,
+    policy: Option<&SessionPolicy>,
+) -> ToolCallResult {
+    let query = arguments
+        .get("query")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let members = match discover_workspace(repo_root) {
+        Ok(members) => members,
+        Err(err) => return fail(err),
+    };
+    let mut collected = Vec::new();
+    for member in members {
+        let repo_id = RepoId::from_path(&member.root);
+        if let Some(p) = policy {
+            if !p.allows_repository(repo_id.as_str()) {
+                continue;
+            }
+        }
+        let Ok(db_path) = agent_core::paths::StoragePaths::repo_db_path(&repo_id) else {
+            continue;
+        };
+        if !db_path.is_file() {
+            continue;
+        }
+        let Ok(db) = IndexDatabase::open(&db_path) else {
+            continue;
+        };
+        if let Ok(symbols) = db.list_symbols_paginated(&repo_id, query, 0, 200) {
+            for sym in symbols {
+                collected.push(json!({
+                    "repository": member.name,
+                    "repo_id": repo_id.as_str(),
+                    "symbol": sym
+                }));
+            }
+        }
+    }
+    let (page, truncated, next_cursor) = paginate_vec(collected, arguments, 50, 200);
+    ok(json!({ "symbols": page, "truncated": truncated, "next_cursor": next_cursor }))
+}
+
 fn fact_extract(
     git: &GitRepo,
     db: &IndexDatabase,
     repo_id: &RepoId,
     repo_info: &RepoInfo,
+    policy: Option<&SessionPolicy>,
 ) -> ToolCallResult {
     let commit = repo_info
         .head_commit
@@ -734,23 +936,29 @@ fn fact_extract(
     if let Ok(symbols) = db.list_symbols(repo_id.as_str()) {
         facts.extend(facts_from_symbols(repo_id.as_str(), &commit, &symbols));
     }
-    let store = match FactStore::for_repo(repo_id) {
+    let store = match scoped_fact_store(repo_id, policy) {
         Ok(store) => store,
         Err(err) => return fail(err),
     };
-    for fact in &facts {
-        if let Err(err) = store.upsert(fact) {
+    if let Err(err) = store.upsert_batch(&facts) {
+        return fail(err);
+    }
+    if policy.is_none()
+        || matches!(policy, Some(p) if matches!(p.scope, agent_skills::SharedContextScope::Repository(_)))
+    {
+        if let Err(err) = project_facts(db, repo_info, &facts) {
             return fail(err);
         }
-    }
-    if let Err(err) = project_facts(db, repo_info, &facts) {
-        return fail(err);
     }
     ok(json!({ "stored": facts.len(), "commit": commit }))
 }
 
-fn fact_list(repo_id: &RepoId) -> ToolCallResult {
-    let store = match FactStore::for_repo(repo_id) {
+fn fact_list(
+    repo_id: &RepoId,
+    arguments: &Value,
+    policy: Option<&SessionPolicy>,
+) -> ToolCallResult {
+    let store = match scoped_fact_store(repo_id, policy) {
         Ok(store) => store,
         Err(err) => return fail(err),
     };
@@ -759,7 +967,6 @@ fn fact_list(repo_id: &RepoId) -> ToolCallResult {
             let now = Utc::now();
             let listed = facts
                 .into_iter()
-                .take(200)
                 .map(|fact| {
                     let effective = store.effective_confidence(&fact, now);
                     json!({
@@ -773,32 +980,47 @@ fn fact_list(repo_id: &RepoId) -> ToolCallResult {
                     })
                 })
                 .collect::<Vec<_>>();
-            ok(json!({ "facts": listed }))
+            let (page, truncated, next_cursor) = paginate_vec(listed, arguments, 200, 200);
+            ok(json!({ "facts": page, "truncated": truncated, "next_cursor": next_cursor }))
         }
         Err(err) => fail(err),
     }
 }
 
-fn fact_decay(db: &IndexDatabase, repo_info: &RepoInfo, arguments: &Value) -> ToolCallResult {
+fn fact_decay(
+    db: &IndexDatabase,
+    repo_info: &RepoInfo,
+    arguments: &Value,
+    policy: Option<&SessionPolicy>,
+) -> ToolCallResult {
     let repo_id = &repo_info.id;
     let half_life = arguments
         .get("half_life_days")
         .and_then(|value| value.as_f64())
         .unwrap_or(DEFAULT_HALF_LIFE_DAYS);
-    let store = match FactStore::for_repo(repo_id) {
+    let store = match scoped_fact_store(repo_id, policy) {
         Ok(store) => store,
         Err(err) => return fail(err),
     };
     match store.decay(Utc::now(), half_life) {
         Ok(changed) => match store.list(repo_id.as_str()) {
-            Ok(facts) => match project_facts(db, repo_info, &facts) {
-                Ok(projected) => ok(json!({
+            Ok(facts) => {
+                let projected = if policy.is_none()
+                    || matches!(policy, Some(p) if matches!(p.scope, agent_skills::SharedContextScope::Repository(_)))
+                {
+                    match project_facts(db, repo_info, &facts) {
+                        Ok(n) => n,
+                        Err(err) => return fail(err),
+                    }
+                } else {
+                    0
+                };
+                ok(json!({
                     "updated": changed,
                     "projected": projected,
                     "half_life_days": half_life
-                })),
-                Err(err) => fail(err),
-            },
+                }))
+            }
             Err(err) => fail(err),
         },
         Err(err) => fail(err),
@@ -818,6 +1040,8 @@ mod tests {
     fn test_filter_rejects_shell_syntax() {
         assert!(valid_test_filter("auth::rotate"));
         assert!(!valid_test_filter(""));
+        assert!(!valid_test_filter("--manifest-path=/etc/passwd"));
+        assert!(!valid_test_filter("-p"));
         assert!(!valid_test_filter("auth; rm -rf /"));
         assert!(!valid_test_filter("$(id)"));
         assert!(!valid_test_filter("a b"));

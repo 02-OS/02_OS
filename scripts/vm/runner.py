@@ -96,6 +96,8 @@ def prepare(args):
     metadata = {"image": runner_image, "image_reference": args.runner_image,
                 "iso": str(iso), "iso_revision": manifest["revision"],
                 "iso_sha256": manifest["sha256"], "firmware": args.firmware, "graphics": args.graphics,
+                "accel": getattr(args, "accel", "auto"),
+                "render_node": getattr(args, "render_node", "/dev/dri/renderD128"),
                 "serial": "02TEST-" + identity, "name": "02os-acceptance-" + identity,
                 "installed": False, "host_block_devices": False, "host_filesystem_shares": False,
                 "dns": args.dns}
@@ -137,7 +139,21 @@ def load(run):
     return run, metadata
 
 
-def start(run, phase):
+def resolve_accel(requested):
+    mode = (requested or "auto").lower()
+    if mode not in ("auto", "kvm", "tcg"):
+        raise ValueError(f"Unsupported accelerator mode: {requested}")
+    kvm_available = Path("/dev/kvm").exists() and os.access("/dev/kvm", os.R_OK | os.W_OK)
+    if mode == "kvm":
+        if not kvm_available:
+            raise RuntimeError("/dev/kvm is not accessible; pass --accel tcg or --accel auto")
+        return "kvm"
+    if mode == "tcg":
+        return "tcg"
+    return "kvm" if kvm_available else "tcg"
+
+
+def start(run, phase, accel_override=None, render_node_override=None):
     run, data = load(run)
     if docker("ps", "--filter", f"name=^{data['name']}$", "-q"):
         raise ValueError("This disposable VM is already running")
@@ -147,7 +163,10 @@ def start(run, phase):
         path = run / name
         if path.exists():
             path.unlink()
-    qemu = ["/usr/bin/qemu-system-x86_64", "-machine", "q35", "-accel", "kvm", "-cpu", "host",
+    effective_accel = resolve_accel(accel_override or data.get("accel", "auto"))
+    cpu_model = "host" if effective_accel == "kvm" else "max"
+    accel_arg = "kvm" if effective_accel == "kvm" else "tcg,thread=multi"
+    qemu = ["/usr/bin/qemu-system-x86_64", "-machine", "q35", "-accel", accel_arg, "-cpu", cpu_model,
             "-m", "4096", "-smp", "4", "-device", "qemu-xhci", "-device", "usb-tablet",
             "-drive", f"if=none,id=testdisk,file={run}/disk.qcow2,format=qcow2",
             "-device", f"virtio-blk-pci,drive=testdisk,serial={data['serial']}",
@@ -157,10 +176,11 @@ def start(run, phase):
             "-netdev", "user,id=network", "-device", "virtio-net-pci,netdev=network,romfile=",
             "-audiodev", f"wav,id=audio0,path={run}/{phase}-audio.wav",
             "-device", "ich9-intel-hda", "-device", "hda-duplex,audiodev=audio0", "-no-reboot"]
-    devices = ["/dev/kvm"]
-    if data["graphics"] == "gl":
-        devices.append("/dev/dri/renderD128")
-        qemu += ["-device", "virtio-vga-gl", "-display", "egl-headless,rendernode=/dev/dri/renderD128"]
+    devices = ["/dev/kvm"] if effective_accel == "kvm" else []
+    render_node = render_node_override or data.get("render_node") or "/dev/dri/renderD128"
+    if data["graphics"] == "gl" and Path(render_node).exists():
+        devices.append(render_node)
+        qemu += ["-device", "virtio-vga-gl", "-display", f"egl-headless,rendernode={render_node}"]
     else:
         qemu += ["-device", "virtio-vga", "-display", "none"]
     if data["firmware"] == "uefi":
@@ -249,6 +269,8 @@ def main():
     prep.add_argument("--dns", action="append", default=[], help="Upstream DNS address for the runner container; repeatable")
     prep.add_argument("--firmware", choices=("uefi", "bios"), default="uefi")
     prep.add_argument("--graphics", choices=("software", "gl"), default="software")
+    prep.add_argument("--accel", choices=("auto", "kvm", "tcg"), default="auto")
+    prep.add_argument("--render-node", default="/dev/dri/renderD128")
     prep.add_argument("--firmware-code", type=Path)
     prep.add_argument("--firmware-vars", type=Path)
     for mode in ("start", "stop", "snapshot", "install", "capture"):
@@ -256,13 +278,15 @@ def main():
         part.add_argument("--run", type=Path, required=True)
         if mode == "start":
             part.add_argument("--phase", choices=("live", "disk"), default="live")
+            part.add_argument("--accel", choices=("auto", "kvm", "tcg"), default=None)
+            part.add_argument("--render-node", default=None)
         if mode in ("snapshot", "install"):
             part.add_argument("--timeout", type=int, default=300 if mode == "snapshot" else 3000)
     args = parser.parse_args()
     if args.mode == "prepare":
         prepare(args)
     elif args.mode == "start":
-        start(args.run, args.phase)
+        start(args.run, args.phase, args.accel, args.render_node)
     elif args.mode in ("snapshot", "install"):
         guest(args.run, args.mode, args.timeout)
     elif args.mode == "stop":

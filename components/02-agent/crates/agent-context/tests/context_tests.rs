@@ -509,3 +509,110 @@ fn secret_named_dirty_file_is_omitted_from_context() {
         .iter()
         .any(|file| file.relative_path == "src/lib.rs"));
 }
+
+#[test]
+fn compile_deduplicates_exact_matches_and_includes_facts_and_docs() {
+    use agent_memory::{extract::facts_from_symbols, FactStore};
+
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let repo = Repository::init(root).unwrap();
+    let sig = git2::Signature::now("Engineer", "dev@02os.org").unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+
+    fs::write(
+        root.join("src/auth.rs"),
+        "/// Validates an active refresh session.\npub fn validate() -> bool { helper() }\npub fn helper() -> bool { true }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("tests/auth_test.rs"),
+        "#[test]\nfn test_validate() { validate(); }\n",
+    )
+    .unwrap();
+
+    let mut index = repo.index().unwrap();
+    index
+        .add_all(["*"].iter(), git2::IndexAddOption::FORCE, None)
+        .unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let commit = repo
+        .commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+
+    let repo_id = RepoId::from_path(root);
+    let mut db =
+        IndexDatabase::open(agent_core::paths::StoragePaths::repo_db_path(&repo_id).unwrap())
+            .unwrap();
+    let info = RepoInfo {
+        id: repo_id.clone(),
+        name: "dedup".into(),
+        root_path: root.to_path_buf(),
+        head_commit: Some(commit.to_string()),
+        branch: Some("master".into()),
+        is_clean: true,
+        modified_count: 0,
+        untracked_count: 0,
+    };
+    db.update_repo_info(&info).unwrap();
+    let scanned = RepoScanner::new(root, RepoConfig::default()).scan();
+    db.save_scanned_files(&repo_id, &scanned).unwrap();
+    let mut symbols = Vec::new();
+    let mut references = Vec::new();
+    for item in &scanned {
+        if let Some(ref text) = item.content {
+            let ext = agent_parser::CodeExtractor::extract(
+                &item.file.relative_path,
+                text,
+                item.file.language,
+            )
+            .unwrap();
+            symbols.extend(ext.symbols);
+            references.extend(ext.references);
+        }
+    }
+    db.save_symbols_and_references(&repo_id, &symbols, &references)
+        .unwrap();
+    db.complete_index(
+        &info,
+        &RepoScanner::scan_fingerprint(&scanned, &RepoConfig::default()),
+    )
+    .unwrap();
+
+    let fact_store = FactStore::for_repo(&repo_id).unwrap();
+    let facts = facts_from_symbols(repo_id.as_str(), &commit.to_string(), &symbols);
+    fact_store.upsert_batch(&facts).unwrap();
+
+    let package = ContextCompiler::compile(root, "validate", 8000).unwrap();
+    let validate_count = package
+        .relevant_symbols
+        .iter()
+        .filter(|s| s.symbol.name == "validate")
+        .count();
+    assert_eq!(validate_count, 1);
+    let sym = package
+        .relevant_symbols
+        .iter()
+        .find(|s| s.symbol.name == "validate")
+        .unwrap();
+    assert_eq!(
+        sym.symbol.doc_comment.as_deref(),
+        Some("Validates an active refresh session.")
+    );
+    assert_eq!(package.dependencies.len(), 2);
+    assert!(package
+        .dependencies
+        .iter()
+        .any(|d| d.caller == "validate" && d.callee == "helper"));
+    assert!(package
+        .dependencies
+        .iter()
+        .any(|d| d.caller == "test_validate" && d.callee == "validate"));
+    assert_eq!(package.relevant_tests.len(), 1);
+    assert!(!package.relevant_facts.is_empty());
+    let md = package.to_markdown();
+    assert!(md.contains("Validates an active refresh session."));
+    assert!(md.contains("## Anchored Facts"));
+}

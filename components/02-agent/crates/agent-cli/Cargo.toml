@@ -18,6 +18,7 @@ agent-memory = { path = "../agent-memory" }
 agent-context = { path = "../agent-context" }
 agent-mcp = { path = "../agent-mcp" }
 agent-daemon = { path = "../agent-daemon" }
+agent-skills = { path = "../agent-skills" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

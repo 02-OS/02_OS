@@ -116,6 +116,36 @@ fn add_cognify_export_and_supersede() {
         .iter()
         .any(|edge| edge.kind == EdgeKind::TouchedInCommit));
 
+    let worktree_only_dir = tempfile::tempdir().unwrap();
+    git_repo(worktree_only_dir.path());
+    fs::create_dir_all(worktree_only_dir.path().join("docs")).unwrap();
+    commit_file(
+        worktree_only_dir.path(),
+        "docs/arch.md",
+        "# Docs should stay out of worktree-only add",
+    );
+    let wdb = IndexDatabase::open(worktree_only_dir.path().join("index.sqlite")).unwrap();
+    let mut whandle = RepoHandle::open_with_db(worktree_only_dir.path(), wdb).unwrap();
+    let worktree_report = add_pipeline(
+        &mut whandle,
+        &AddRequest {
+            sources: vec![SourceKind::Worktree],
+            dataset_name: None,
+            text: None,
+            full: false,
+        },
+        &TaskRegistry::new(),
+    )
+    .unwrap();
+    let wpoints = whandle
+        .db
+        .list_datapoints(&worktree_report.dataset_id)
+        .unwrap();
+    assert!(wpoints
+        .iter()
+        .all(|p| !p.provenance.path.ends_with(".md")
+            && p.provenance.source_kind == SourceKind::Worktree));
+
     let caller = symbols
         .iter()
         .find(|symbol| symbol.name == "caller")

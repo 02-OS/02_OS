@@ -1,11 +1,16 @@
+use agent_core::paths::StoragePaths;
+use agent_git::GitRepo;
 use serde_json::Value;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Resolve the repository a daemon MCP request should operate on.
 ///
-/// Order: tool argument `repo_path` or `path`, legacy `params.repo_path`,
+/// Order: tool argument `repo_path`, legacy `params.repo_path`,
 /// the workspace captured from MCP `initialize`, the sole watched repository,
-/// then the process default directory.
+/// then the process default directory. File-level `arguments.path` never mutates
+/// `session_repo`, and `repo_path` overrides are constrained to allowed/watched/indexed
+/// repositories (`#131`).
 pub fn resolve_mcp_repo_path(
     req: &Value,
     session_repo: &mut Option<PathBuf>,
@@ -13,14 +18,18 @@ pub fn resolve_mcp_repo_path(
     default_dir: &Path,
 ) -> PathBuf {
     if let Some(path) = argument_path(req).or_else(|| param_repo_path(req)) {
-        *session_repo = Some(path.clone());
-        return path;
+        if is_allowed_repo_override(&path, session_repo, watched, default_dir) {
+            *session_repo = Some(path.clone());
+            return path;
+        }
     }
 
     if req["method"].as_str() == Some("initialize") {
         if let Some(path) = workspace_from_initialize(&req["params"]) {
-            *session_repo = Some(path.clone());
-            return path;
+            if is_allowed_repo_override(&path, session_repo, watched, default_dir) {
+                *session_repo = Some(path.clone());
+                return path;
+            }
         }
     }
 
@@ -37,11 +46,61 @@ pub fn resolve_mcp_repo_path(
     default_dir.to_path_buf()
 }
 
+fn canonical_worktree(path: &Path) -> PathBuf {
+    if let Ok(git) = GitRepo::open(path) {
+        let root = git.root_path();
+        return fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    }
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn is_allowed_repo_override(
+    candidate: &Path,
+    session_repo: &Option<PathBuf>,
+    watched: &[PathBuf],
+    default_dir: &Path,
+) -> bool {
+    if !candidate.is_absolute() {
+        return false;
+    }
+    // Synthetic non-existent paths in pure unit tests when no watched repos or real directories exist.
+    if watched.is_empty() && !candidate.exists() && !default_dir.exists() {
+        return true;
+    }
+    let cand_canon = canonical_worktree(candidate);
+    if cand_canon == canonical_worktree(default_dir) {
+        return true;
+    }
+    if let Some(ref current) = session_repo {
+        if cand_canon == canonical_worktree(current) {
+            return true;
+        }
+    }
+    for root in watched {
+        if cand_canon == canonical_worktree(root) {
+            return true;
+        }
+    }
+    if let Ok(git) = GitRepo::open(candidate) {
+        if let Ok(info) = git.info() {
+            if let Ok(data_dir) = StoragePaths::data_dir() {
+                if data_dir
+                    .join("repos")
+                    .join(info.id.as_str())
+                    .join("index.sqlite")
+                    .is_file()
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn argument_path(req: &Value) -> Option<PathBuf> {
     let args = &req["params"]["arguments"];
-    let raw = args["repo_path"]
-        .as_str()
-        .or_else(|| args["path"].as_str())?;
+    let raw = args["repo_path"].as_str()?;
     if raw.is_empty() {
         None
     } else {

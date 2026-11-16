@@ -8,4 +8,4 @@ pub mod tools;
 pub use connect::{AgentConnector, AgentTarget};
 pub use protocol::{JsonRpcRequest, JsonRpcResponse, ToolCallResult, ToolDefinition};
 pub use server::McpServer;
-pub use tools::{call_tool, list_tools};
+pub use tools::{call_tool, call_tool_with_policy, list_tools};

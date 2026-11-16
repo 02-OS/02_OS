@@ -57,7 +57,7 @@
       "license_source": "https://raw.githubusercontent.com/pop-os/shell/master_noble/LICENSE",
       "snapshot_commit_verified": false,
       "inspected_upstream_head": "7898b65c20735057faf0797f8ed056704ca55f0d",
-      "content_sha256": "f86e6f0b8705898ddfbc2c64460e5341e24a447ea3d321a64418c52730945637",
+      "content_sha256": "d9ea1a9a5b729d96969bdc138fd148884e8ab408b5cd95a54d80ed2b2424d0d0",
       "content_sha256_excludes": [
         "PROVENANCE.md"
       ],

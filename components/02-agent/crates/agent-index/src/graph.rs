@@ -469,47 +469,48 @@ impl IndexDatabase {
                 "graph traversal depth cannot exceed 8".into(),
             ));
         }
-        let mut stmt = self
-            .conn
-            .prepare("SELECT src_id, dst_id FROM graph_edges WHERE dataset_id = ?1")
-            .map_err(|e| AgentError::Database(format!("Prepare traversal failed: {}", e)))?;
-        let rows = stmt
-            .query_map(params![dataset_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| AgentError::Database(format!("Traversal query failed: {}", e)))?;
-        let mut adjacent: HashMap<String, Vec<String>> = HashMap::new();
-        for row in rows {
-            let (src, dst) =
-                row.map_err(|e| AgentError::Database(format!("Traversal row failed: {}", e)))?;
-            adjacent.entry(src).or_default().push(dst);
-        }
-        drop(stmt);
 
         let mut best: HashMap<String, usize> = HashMap::new();
         best.insert(start.to_string(), 0);
         let mut frontier = vec![start.to_string()];
         let mut current = 0usize;
-        while current < depth {
+
+        while current < depth && !frontier.is_empty() {
             let mut next = Vec::new();
-            for id in frontier {
-                let Some(neighbors) = adjacent.get(&id) else {
-                    continue;
-                };
-                for dst in neighbors {
-                    if best.contains_key(dst) {
-                        continue;
-                    }
-                    best.insert(dst.clone(), current + 1);
-                    next.push(dst.clone());
+            for chunk in frontier.chunks(200) {
+                let placeholders = (0..chunk.len())
+                    .map(|idx| format!("?{}", idx + 2))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT dst_id FROM graph_edges WHERE dataset_id = ?1 AND src_id IN ({placeholders})"
+                );
+                let mut stmt = self.conn.prepare_cached(&sql).map_err(|e| {
+                    AgentError::Database(format!("Prepare traversal failed: {}", e))
+                })?;
+                let mut bind_values: Vec<&dyn rusqlite::ToSql> =
+                    Vec::with_capacity(1 + chunk.len());
+                bind_values.push(&dataset_id);
+                for src in chunk {
+                    bind_values.push(src);
                 }
-            }
-            if next.is_empty() {
-                break;
+                let rows = stmt
+                    .query_map(bind_values.as_slice(), |row| row.get::<_, String>(0))
+                    .map_err(|e| AgentError::Database(format!("Traversal query failed: {}", e)))?;
+                for row in rows {
+                    let dst = row.map_err(|e| {
+                        AgentError::Database(format!("Traversal row failed: {}", e))
+                    })?;
+                    if !best.contains_key(&dst) {
+                        best.insert(dst.clone(), current + 1);
+                        next.push(dst);
+                    }
+                }
             }
             frontier = next;
             current += 1;
         }
+
         let mut found: Vec<(String, usize)> = best.into_iter().collect();
         found.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
         Ok(found)
@@ -530,6 +531,7 @@ impl IndexDatabase {
                     "src": edge.src_id,
                     "dst": edge.dst_id,
                     "kind": edge.kind.as_str(),
+                    "payload": edge.payload,
                 })).collect::<Vec<_>>(),
             }))
             .map_err(|e| AgentError::General(format!("Graph JSON failed: {}", e)))?,
@@ -601,45 +603,83 @@ impl IndexDatabase {
             }
         }
         drop(stmt);
+
+        let chunk_nodes: Vec<String> = self
+            .list_nodes(dataset_id)?
+            .into_iter()
+            .filter(|node| {
+                node.kind == "chunk" && !keep.contains(datapoint_file_path("chunk", &node.label))
+            })
+            .map(|node| node.id)
+            .collect();
+
+        if drop_ids.is_empty() && chunk_nodes.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.conn.transaction().map_err(|e| {
+            AgentError::Database(format!("Absent points transaction failed: {}", e))
+        })?;
         for id in &drop_ids {
-            delete_node(&self.conn, id)?;
-            let mut linked_stmt = self
-                .conn
-                .prepare("SELECT id FROM graph_nodes WHERE datapoint_id = ?1")
-                .map_err(|e| {
-                    AgentError::Database(format!("Datapoint node lookup failed: {}", e))
-                })?;
-            let linked = linked_stmt
-                .query_map(params![id], |row| row.get::<_, String>(0))
-                .map_err(|e| {
-                    AgentError::Database(format!("Datapoint node lookup failed: {}", e))
-                })?;
-            let mut node_ids = Vec::new();
-            for node_id in linked {
-                node_ids.push(node_id.map_err(|e| {
-                    AgentError::Database(format!("Datapoint node row failed: {}", e))
-                })?);
-            }
-            drop(linked_stmt);
+            delete_node_cached(&tx, id)?;
+            let node_ids: Vec<String> = {
+                let mut linked_stmt = tx
+                    .prepare_cached("SELECT id FROM graph_nodes WHERE datapoint_id = ?1")
+                    .map_err(|e| {
+                        AgentError::Database(format!("Datapoint node lookup failed: {}", e))
+                    })?;
+                let linked = linked_stmt
+                    .query_map(params![id], |row| row.get::<_, String>(0))
+                    .map_err(|e| {
+                        AgentError::Database(format!("Datapoint node lookup failed: {}", e))
+                    })?;
+                linked
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|e| {
+                        AgentError::Database(format!("Datapoint node row failed: {}", e))
+                    })?
+            };
             for node_id in node_ids {
-                delete_node(&self.conn, &node_id)?;
+                delete_node_cached(&tx, &node_id)?;
             }
-            self.conn
-                .execute("DELETE FROM datapoints WHERE id = ?1", params![id])
+            let mut del_dp = tx
+                .prepare_cached("DELETE FROM datapoints WHERE id = ?1")
+                .map_err(|e| {
+                    AgentError::Database(format!("Prepare datapoint delete failed: {}", e))
+                })?;
+            del_dp
+                .execute(params![id])
                 .map_err(|e| AgentError::Database(format!("Datapoint delete failed: {}", e)))?;
         }
-        let nodes = self.list_nodes(dataset_id)?;
-        for node in nodes {
-            if node.kind != "chunk" {
-                continue;
-            }
-            let owner = datapoint_file_path("chunk", &node.label);
-            if !keep.contains(owner) {
-                delete_node(&self.conn, &node.id)?;
-            }
+        for node_id in chunk_nodes {
+            delete_node_cached(&tx, &node_id)?;
         }
+        tx.commit()
+            .map_err(|e| AgentError::Database(format!("Absent points commit failed: {}", e)))?;
         Ok(())
     }
+}
+
+fn delete_node_cached(conn: &rusqlite::Connection, id: &str) -> Result<()> {
+    let mut del_edges = conn
+        .prepare_cached("DELETE FROM graph_edges WHERE src_id = ?1 OR dst_id = ?1")
+        .map_err(|e| AgentError::Database(format!("Prepare edge delete failed: {}", e)))?;
+    del_edges
+        .execute(params![id])
+        .map_err(|e| AgentError::Database(format!("Node edge delete failed: {}", e)))?;
+    let mut del_members = conn
+        .prepare_cached("DELETE FROM node_set_members WHERE node_id = ?1")
+        .map_err(|e| AgentError::Database(format!("Prepare set delete failed: {}", e)))?;
+    del_members
+        .execute(params![id])
+        .map_err(|e| AgentError::Database(format!("Node set delete failed: {}", e)))?;
+    let mut del_node = conn
+        .prepare_cached("DELETE FROM graph_nodes WHERE id = ?1")
+        .map_err(|e| AgentError::Database(format!("Prepare node delete failed: {}", e)))?;
+    del_node
+        .execute(params![id])
+        .map_err(|e| AgentError::Database(format!("Node delete failed: {}", e)))?;
+    Ok(())
 }
 
 fn delete_node(conn: &rusqlite::Connection, id: &str) -> Result<()> {

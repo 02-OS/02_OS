@@ -21,11 +21,13 @@ const box = new Gtk.Box({
 const label = new Gtk.Label({
     label: [
         "Super + Y            Toggle tiling",
-        "Super + Left/Right   Tile left or right",
-        "Super + Up/Down      Tile up or down",
-        "Super + Enter        Toggle floating",
-        "Super + M            Maximize",
+        "Super + G            Toggle floating",
+        "Super + Left/Right   Focus window left or right",
+        "Super + Up/Down      Focus window up or down",
+        "Super + Enter        Enter tile adjustment mode",
+        "Super + M            Toggle maximize",
         "Super + Q            Close window",
+        "Super + L            Lock screen",
     ].join("\n"),
     xalign: 0,
     wrap: true,

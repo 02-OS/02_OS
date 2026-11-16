@@ -1,6 +1,16 @@
 use agent_core::types::{EvidenceMemory, Symbol};
-use agent_core::SecretPattern;
+use agent_core::{truncate_chars, SecretPattern};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoredFact {
+    pub id: String,
+    pub claim: String,
+    pub relative_path: String,
+    pub symbol: Option<String>,
+    pub effective_confidence: f64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredFile {
@@ -71,6 +81,8 @@ pub struct EvidencePackage {
     pub verified_memories: Vec<EvidenceMemory>,
     #[serde(default)]
     pub diagnostic_memories: Vec<EvidenceMemory>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relevant_facts: Vec<ScoredFact>,
     pub git_context: GitContextSummary,
     pub budget: BudgetReport,
 }
@@ -88,6 +100,16 @@ impl EvidencePackage {
             .chain(&mut safe.diagnostic_memories)
         {
             memory.claim = SecretPattern::redact(&memory.claim);
+        }
+        for fact in &mut safe.relevant_facts {
+            fact.claim = SecretPattern::redact(&fact.claim);
+        }
+        for sym in &mut safe.relevant_symbols {
+            if let Some(doc) = sym.symbol.doc_comment.as_mut() {
+                if let Cow::Owned(redacted) = SecretPattern::redact_cow(doc) {
+                    *doc = redacted;
+                }
+            }
         }
         serde_json::to_string_pretty(&safe).unwrap_or_else(|_| "{}".to_string())
     }
@@ -130,7 +152,7 @@ impl EvidencePackage {
                     md.push_str(&format!(
                         "  - source: `{}` (commit {})\n",
                         ev.file,
-                        &ev.commit[..ev.commit.len().min(7)]
+                        truncate_chars(&ev.commit, 7)
                     ));
                 }
             }
@@ -143,6 +165,17 @@ impl EvidencePackage {
                 md.push_str(&format!(
                     "- **[{}]** {} (status: {}, confidence: {:.2})\n",
                     m.id, m.claim, m.status, m.confidence
+                ));
+            }
+            md.push('\n');
+        }
+
+        if !self.relevant_facts.is_empty() {
+            md.push_str("## Anchored Facts\n");
+            for f in &self.relevant_facts {
+                md.push_str(&format!(
+                    "- `{}`: {} (confidence: {:.2})\n",
+                    f.relative_path, f.claim, f.effective_confidence
                 ));
             }
             md.push('\n');
@@ -179,6 +212,12 @@ impl EvidencePackage {
                     "- `{}` in `{}:{}` ({:?})\n",
                     sig, s.symbol.file_path, s.symbol.start_line, s.symbol.kind
                 ));
+                if let Some(ref doc) = s.symbol.doc_comment {
+                    let doc_summary = truncate_chars(doc.trim(), 160);
+                    if !doc_summary.is_empty() {
+                        md.push_str(&format!("  - doc: {}\n", doc_summary));
+                    }
+                }
             }
             md.push('\n');
         }
@@ -213,7 +252,7 @@ impl EvidencePackage {
             for c in &self.git_context.recent_commits {
                 md.push_str(&format!(
                     "- `{}` {} ({})\n",
-                    &c.commit_id[..c.commit_id.len().min(7)],
+                    truncate_chars(&c.commit_id, 7),
                     SecretPattern::redact(&c.summary),
                     SecretPattern::redact(&c.author)
                 ));
@@ -227,9 +266,5 @@ impl EvidencePackage {
 
 fn bound_display(text: &str, max_tokens: usize) -> String {
     let max_chars = max_tokens.saturating_mul(4);
-    let mut end = text.len().min(max_chars);
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_string()
+    truncate_chars(text, max_chars).to_string()
 }

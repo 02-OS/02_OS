@@ -1,6 +1,9 @@
-use crate::extractor::{declaration_id, ExtractionResult};
+use crate::extractor::{
+    declaration_id, extract_doc_comment, qualified_name, walk_tree, ExtractionResult, WalkAction,
+};
 use agent_core::types::{ReferenceKind, Symbol, SymbolKind, SymbolReference};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use tree_sitter::{Node, Parser};
 
 pub enum Kind {
@@ -53,54 +56,78 @@ fn walk(
     symbols: &mut Vec<Symbol>,
     references: &mut Vec<SymbolReference>,
 ) {
-    struct Frame<'a> {
-        node: Node<'a>,
-        scope: Vec<String>,
-        current: Option<String>,
-        current_id: Option<String>,
-    }
+    let mut seen_tests: HashSet<(Vec<String>, String, usize)> = HashSet::new();
 
-    // Heap stack: deeply nested expressions must not overflow the native stack.
-    let mut stack = vec![Frame {
-        node: root,
-        scope: Vec::new(),
-        current: None,
-        current_id: None,
-    }];
+    walk_tree(root, |node, scope, cur, cur_id| {
+        let mut action = WalkAction::Same;
+        let mut active_name = cur;
+        let mut active_id = cur_id;
+        let mut declared_name: Option<String> = None;
+        let mut declared_id: Option<String> = None;
 
-    while let Some(Frame {
-        node,
-        scope,
-        current,
-        current_id,
-    }) = stack.pop()
-    {
-        let mut child_scope = scope.clone();
-        let mut next = current.clone();
-        let mut next_id = current_id.clone();
-        if let Some(kind) = symbol_kind(node.kind()) {
+        if node.kind() == "variable_declarator" {
+            if let (Some(name_node), Some(val_node)) = (
+                node.child_by_field_name("name"),
+                node.child_by_field_name("value"),
+            ) {
+                if matches!(
+                    val_node.kind(),
+                    "arrow_function" | "function_expression" | "function" | "generator_function"
+                ) {
+                    if let Some(name) = identifier_text(content, name_node) {
+                        if !is_noise(name) {
+                            let line = node.start_position().row + 1;
+                            let owned = name.to_string();
+                            let body = node_text(content, node);
+                            let id = declaration_id(file_path, scope, &owned, node.start_byte());
+                            symbols.push(Symbol {
+                                id: id.clone(),
+                                name: owned.clone(),
+                                qualified_name: qualified_name(file_path, scope, &owned),
+                                kind: SymbolKind::Function,
+                                file_path: file_path.to_string(),
+                                start_line: line,
+                                end_line: node.end_position().row + 1,
+                                signature: Some(first_line(body).to_string()),
+                                doc_comment: extract_doc_comment(content, node, false),
+                                fingerprint: fingerprint(body),
+                            });
+                            declared_name = Some(owned.clone());
+                            declared_id = Some(id.clone());
+                            action = WalkAction::EnterSymbol { name: owned, id };
+                        }
+                    }
+                }
+            }
+        } else if let Some(kind) = symbol_kind(node.kind()) {
             if let Some(name) = symbol_name(content, node) {
                 if !is_noise(name) {
                     let line = node.start_position().row + 1;
                     let owned = name.to_string();
                     let body = node_text(content, node);
+                    let id = declaration_id(file_path, scope, &owned, node.start_byte());
                     symbols.push(Symbol {
-                        id: declaration_id(file_path, &scope, &owned, node.start_byte()),
+                        id: id.clone(),
                         name: owned.clone(),
-                        qualified_name: format!("{file_path}::{owned}"),
+                        qualified_name: qualified_name(file_path, scope, &owned),
                         kind,
                         file_path: file_path.to_string(),
                         start_line: line,
                         end_line: node.end_position().row + 1,
                         signature: Some(first_line(body).to_string()),
-                        doc_comment: None,
+                        doc_comment: extract_doc_comment(content, node, false),
                         fingerprint: fingerprint(body),
                     });
-                    next_id = Some(declaration_id(file_path, &scope, &owned, node.start_byte()));
-                    child_scope.push(owned.clone());
-                    next = Some(owned);
+                    declared_name = Some(owned.clone());
+                    declared_id = Some(id.clone());
+                    action = WalkAction::EnterSymbol { name: owned, id };
                 }
             }
+        }
+
+        if let Some(name) = declared_name.as_deref() {
+            active_name = Some(name);
+            active_id = declared_id.as_deref();
         }
 
         if node.kind() == "call_expression" {
@@ -114,8 +141,8 @@ fn walk(
                     };
                     references.push(SymbolReference {
                         source_file: file_path.to_string(),
-                        source_symbol_name: next.clone(),
-                        source_symbol_id: next_id.clone(),
+                        source_symbol_name: active_name.map(str::to_string),
+                        source_symbol_id: active_id.map(str::to_string),
                         target_name: name.to_string(),
                         target_symbol_id: None,
                         kind,
@@ -123,17 +150,18 @@ fn walk(
                     });
                     if name == "test" || name == "group" {
                         if let Some(label) = first_quoted(node_text(content, node)) {
-                            if !symbols.iter().any(|symbol| symbol.name == label) {
+                            let key = (scope.to_vec(), label.to_string(), line);
+                            if seen_tests.insert(key) {
                                 symbols.push(Symbol {
-                                    id: declaration_id(file_path, &scope, label, node.start_byte()),
+                                    id: declaration_id(file_path, scope, label, node.start_byte()),
                                     name: label.to_string(),
-                                    qualified_name: format!("{file_path}::{label}"),
+                                    qualified_name: qualified_name(file_path, scope, label),
                                     kind: SymbolKind::Function,
                                     file_path: file_path.to_string(),
                                     start_line: line,
                                     end_line: line,
                                     signature: Some(format!("{name}('{label}')")),
-                                    doc_comment: None,
+                                    doc_comment: extract_doc_comment(content, node, false),
                                     fingerprint: fingerprint(label),
                                 });
                             }
@@ -148,8 +176,8 @@ fn walk(
             if !text.is_empty() {
                 references.push(SymbolReference {
                     source_file: file_path.to_string(),
-                    source_symbol_name: next.clone(),
-                    source_symbol_id: next_id.clone(),
+                    source_symbol_name: active_name.map(str::to_string),
+                    source_symbol_id: active_id.map(str::to_string),
                     target_name: text.to_string(),
                     target_symbol_id: None,
                     kind: ReferenceKind::Imports,
@@ -158,17 +186,8 @@ fn walk(
             }
         }
 
-        let mut cursor = node.walk();
-        let children: Vec<Node> = node.children(&mut cursor).collect();
-        for child in children.into_iter().rev() {
-            stack.push(Frame {
-                node: child,
-                scope: child_scope.clone(),
-                current: next.clone(),
-                current_id: next_id.clone(),
-            });
-        }
-    }
+        action
+    });
 }
 
 fn symbol_kind(kind: &str) -> Option<SymbolKind> {

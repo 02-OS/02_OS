@@ -218,3 +218,52 @@ fn untracked_directory_child_edits_change_the_fingerprint() {
         "fingerprint did not recurse into the untracked directory: {first}"
     );
 }
+
+#[test]
+fn list_blob_ids_and_commits_touching_avoid_full_tree_scans() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    let sig = git2::Signature::now("Tester", "test@02os.org").unwrap();
+
+    std::fs::write(dir.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+    std::fs::write(dir.path().join("b.rs"), "pub fn b() {}\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("a.rs")).unwrap();
+    index.add_path(std::path::Path::new("b.rs")).unwrap();
+    index.write().unwrap();
+    let t1 = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let c1 = repo
+        .commit(Some("HEAD"), &sig, &sig, "init", &t1, &[])
+        .unwrap();
+
+    std::fs::write(dir.path().join("b.rs"), "pub fn b() { let _ = 1; }\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("b.rs")).unwrap();
+    index.write().unwrap();
+    let t2 = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let p1 = repo.find_commit(c1).unwrap();
+    let c2 = repo
+        .commit(Some("HEAD"), &sig, &sig, "edit b", &t2, &[&p1])
+        .unwrap();
+
+    let git_repo = GitRepo::open(dir.path()).unwrap();
+    let blobs = git_repo.list_blob_ids().unwrap();
+    assert_eq!(blobs.len(), 2);
+    assert_eq!(
+        blobs.get("a.rs"),
+        git_repo.get_blob_id("a.rs").unwrap().as_ref()
+    );
+    assert_eq!(
+        blobs.get("b.rs"),
+        git_repo.get_blob_id("b.rs").unwrap().as_ref()
+    );
+
+    let touching_a = git_repo.commits_touching("a.rs", 10).unwrap();
+    assert_eq!(touching_a.len(), 1);
+    assert_eq!(touching_a[0].id, c1.to_string());
+
+    let touching_b = git_repo.commits_touching("b.rs", 10).unwrap();
+    assert_eq!(touching_b.len(), 2);
+    assert_eq!(touching_b[0].id, c2.to_string());
+    assert_eq!(touching_b[1].id, c1.to_string());
+}
