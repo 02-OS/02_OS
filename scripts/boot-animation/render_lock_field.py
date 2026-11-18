@@ -20,7 +20,7 @@ VEIL = 0.58
 # drawPortalFrame fit on this frame: canvas width is 40% of the width.
 SCALE = (WIDTH * 0.4) * 0.59375 / 680
 ZERO_X = -170 * SCALE + WIDTH / 2
-ZERO_Y = HEIGHT / 2 + 0.5 * SCALE
+ZERO_Y = HEIGHT / 2 - 4.0 * SCALE
 
 
 def cover(path):

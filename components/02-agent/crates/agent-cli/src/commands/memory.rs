@@ -1,4 +1,4 @@
-use agent_core::{paths::StoragePaths, AgentError, Result};
+use agent_core::{paths::StoragePaths, truncate_chars, AgentError, Result};
 use agent_git::{GitDiscovery, GitRepo};
 use agent_index::IndexDatabase;
 use agent_memory::{MemoryStore, MemoryVerifier};
@@ -46,7 +46,7 @@ pub fn execute_list(json_output: bool) -> Result<()> {
                 println!(
                     "    Evidence: {} items (valid at commit: {})",
                     m.evidence.len(),
-                    &m.valid_at[..m.valid_at.len().min(7)]
+                    truncate_chars(&m.valid_at, 7)
                 );
                 println!();
             }
@@ -88,7 +88,7 @@ pub fn execute_inspect(id: &str, json_output: bool) -> Result<()> {
                     println!("        Symbols: {}", ev.symbols.join(", "));
                     println!("        Commit:  {}", ev.commit);
                     if let Some(ref fp) = ev.fingerprint {
-                        println!("        Fingerprint: {}", &fp[..fp.len().min(12)]);
+                        println!("        Fingerprint: {}", truncate_chars(fp, 12));
                     }
                 }
                 println!("==================================================");

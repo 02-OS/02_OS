@@ -190,6 +190,32 @@ fn delete_ids(tx: &rusqlite::Transaction<'_>, ids: &[String]) -> Result<usize> {
     Ok(removed)
 }
 
+/// Check non-blockingly whether an existing `.index.lock` file is held by a live indexer.
+fn try_orphan_lock(dir: &Path) -> Result<Option<fs::File>> {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    let lock_path = dir.join("index.sqlite.index.lock");
+    let meta = match fs::symlink_metadata(&lock_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(AgentError::Io(err)),
+    };
+    if meta.file_type().is_symlink() {
+        return Ok(None);
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path)?;
+    // SAFETY: `file` is a valid open descriptor; non-blocking LOCK_EX prevents racing live indexers.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(AgentError::General(
+            "orphan directory is actively locked".into(),
+        ));
+    }
+    Ok(Some(file))
+}
+
 /// Remove orphan repo directories, prune datapoints, and vacuum each live database.
 pub fn gc_repos(data_dir: &Path) -> Result<GcReport> {
     let repos = data_dir.join("repos");
@@ -200,29 +226,40 @@ pub fn gc_repos(data_dir: &Path) -> Result<GcReport> {
     for entry in fs::read_dir(&repos).map_err(AgentError::Io)? {
         let entry = entry.map_err(AgentError::Io)?;
         let dir = entry.path();
-        if !dir.is_dir() {
+        let meta = match fs::symlink_metadata(&dir) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
             continue;
         }
         let db_path = dir.join("index.sqlite");
         if !db_path.is_file() {
-            let empty = fs::read_dir(&dir).map_err(AgentError::Io)?.next().is_none();
-            if empty {
-                fs::remove_dir_all(&dir).map_err(AgentError::Io)?;
-                report.orphan_directories += 1;
+            let Ok(_orphan_lock) = try_orphan_lock(&dir) else {
+                continue;
+            };
+            // Re-check after non-blocking lock acquisition in case index.sqlite was just created.
+            if db_path.is_file() {
+                continue;
             }
+            fs::remove_dir_all(&dir).map_err(AgentError::Io)?;
+            report.orphan_directories += 1;
             continue;
         }
         let mut db = IndexDatabase::open(&db_path)?;
+        let lock = db.lock_index()?;
         let roots = db.stored_root_paths()?;
         if !roots.is_empty() && roots.iter().all(|path| !path.exists()) {
             drop(db);
             fs::remove_dir_all(&dir).map_err(AgentError::Io)?;
             report.orphan_directories += 1;
+            drop(lock);
             continue;
         }
         report.datapoints_removed += db.gc_database()?;
         db.vacuum()?;
         report.databases_vacuumed += 1;
+        drop(lock);
     }
     Ok(report)
 }

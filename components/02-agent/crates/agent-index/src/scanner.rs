@@ -1,29 +1,23 @@
 use agent_core::{
     config::RepoConfig,
-    contain::read_indexed_bytes,
+    contain::{hash_indexed_file_canon, read_indexed_bytes_canon},
     types::{FileKind, IndexedFile, Language, SecretPattern},
 };
 use chrono::Utc;
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
-/// Directory ignore patterns (`build/`) match a path component, not a string prefix.
-pub fn custom_ignored(rel: &Path, patterns: &[String]) -> bool {
-    if rel.as_os_str().is_empty() {
-        return false;
-    }
-    let components: Vec<&str> = rel
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(name) => name.to_str(),
-            _ => None,
-        })
-        .collect();
-    if components.is_empty() {
-        return false;
-    }
-    let joined = components.join("/");
+#[derive(Debug, Clone)]
+enum CompiledIgnore {
+    Component(String),
+    PathPrefix { exact: String, prefix: String },
+}
+
+fn compile_ignores(patterns: &[String]) -> Vec<CompiledIgnore> {
+    let mut rules = Vec::new();
     for pattern in patterns {
         let trimmed = pattern.trim();
         if trimmed.is_empty() {
@@ -34,22 +28,67 @@ pub fn custom_ignored(rel: &Path, patterns: &[String]) -> bool {
                 continue;
             }
             let name = name.trim_start_matches("./");
-            if (!name.contains('/') && components.contains(&name))
-                || (name.contains('/')
-                    && (joined == name || joined.starts_with(&format!("{name}/"))))
-            {
-                return true;
+            if !name.contains('/') {
+                rules.push(CompiledIgnore::Component(name.to_string()));
+            } else {
+                rules.push(CompiledIgnore::PathPrefix {
+                    exact: name.to_string(),
+                    prefix: format!("{name}/"),
+                });
             }
-        } else if joined == trimmed || joined.starts_with(&format!("{trimmed}/")) {
-            return true;
+        } else {
+            rules.push(CompiledIgnore::PathPrefix {
+                exact: trimmed.to_string(),
+                prefix: format!("{trimmed}/"),
+            });
+        }
+    }
+    rules
+}
+
+fn matches_compiled_ignores(rel: &Path, rules: &[CompiledIgnore]) -> bool {
+    if rules.is_empty() || rel.as_os_str().is_empty() {
+        return false;
+    }
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        if let Component::Normal(name) = component {
+            if let Some(s) = name.to_str() {
+                parts.push(s);
+            }
+        }
+    }
+    if parts.is_empty() {
+        return false;
+    }
+    let joined = parts.join("/");
+    for rule in rules {
+        match rule {
+            CompiledIgnore::Component(name) => {
+                if parts.iter().any(|part| *part == name) {
+                    return true;
+                }
+            }
+            CompiledIgnore::PathPrefix { exact, prefix } => {
+                if joined == *exact || joined.starts_with(prefix) {
+                    return true;
+                }
+            }
         }
     }
     false
 }
 
+/// Directory ignore patterns (`build/`) match a path component, not a string prefix.
+pub fn custom_ignored(rel: &Path, patterns: &[String]) -> bool {
+    matches_compiled_ignores(rel, &compile_ignores(patterns))
+}
+
 pub struct RepoScanner {
     root: PathBuf,
+    root_canon: PathBuf,
     config: RepoConfig,
+    ignore_rules: Arc<Vec<CompiledIgnore>>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,34 +101,66 @@ pub struct ScannedFile {
 impl RepoScanner {
     /// Hash the exact scan inputs, independent of mtimes and enumeration order.
     pub fn scan_fingerprint(scanned: &[ScannedFile], config: &RepoConfig) -> String {
+        let pairs: Vec<(&str, &str)> = scanned
+            .iter()
+            .map(|item| {
+                (
+                    item.file.relative_path.as_str(),
+                    item.file.file_hash.as_str(),
+                )
+            })
+            .collect();
+        Self::hash_fingerprint_pairs(pairs, config)
+    }
+
+    fn hash_fingerprint_pairs<'a>(
+        mut pairs: Vec<(&'a str, &'a str)>,
+        config: &RepoConfig,
+    ) -> String {
         let mut hash = Sha256::new();
         hash.update(b"02-index-snapshot-v1\0");
         // RepoConfig has deterministic field ordering and contains all selection knobs.
         hash.update(serde_json::to_vec(config).expect("RepoConfig is serializable"));
-        let mut files: Vec<_> = scanned.iter().map(|item| &item.file).collect();
-        files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
-        for file in files {
-            hash.update(file.relative_path.as_bytes());
+        pairs.sort_by(|a, b| a.0.cmp(b.0));
+        for (rel_path, file_hash) in pairs {
+            hash.update(rel_path.as_bytes());
             hash.update([0]);
-            hash.update(file.file_hash.as_bytes());
+            hash.update(file_hash.as_bytes());
             hash.update([0]);
         }
         hex::encode(hash.finalize())
     }
 
     pub fn fingerprint(&self) -> String {
-        Self::scan_fingerprint(&self.scan(), &self.config)
+        let max_bytes = self.config.max_file_size_kb * 1024;
+        let mut entries: Vec<(String, String)> = Vec::new();
+        for (path, rel_path, _, _, _) in self.walk_candidate_files() {
+            let Ok(hash) = hash_indexed_file_canon(&self.root, &self.root_canon, &path, max_bytes)
+            else {
+                continue;
+            };
+            entries.push((rel_path, hash));
+        }
+        let pairs: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(p, h)| (p.as_str(), h.as_str()))
+            .collect();
+        Self::hash_fingerprint_pairs(pairs, &self.config)
     }
 
     pub fn new<P: AsRef<Path>>(root: P, config: RepoConfig) -> Self {
+        let root_buf = root.as_ref().to_path_buf();
+        let root_canon = std::fs::canonicalize(&root_buf).unwrap_or_else(|_| root_buf.clone());
+        let ignore_rules = Arc::new(compile_ignores(&config.custom_ignores));
         Self {
-            root: root.as_ref().to_path_buf(),
+            root: root_buf,
+            root_canon,
             config,
+            ignore_rules,
         }
     }
 
-    /// Walk repository and gather indexable files respecting gitignore, 02agentignore, and security rules.
-    pub fn scan(&self) -> Vec<ScannedFile> {
+    fn walk_candidate_files(&self) -> Vec<(PathBuf, String, Language, FileKind, u64)> {
         let mut builder = WalkBuilder::new(&self.root);
         builder.hidden(false); // allow inspecting dotfiles like .gitignore
         builder.git_ignore(true);
@@ -97,49 +168,38 @@ impl RepoScanner {
         builder.git_exclude(true);
         builder.follow_links(false);
         let ignore_root = self.root.clone();
-        let ignore_patterns = self.config.custom_ignores.clone();
+        let rules = Arc::clone(&self.ignore_rules);
         builder.filter_entry(move |entry| match entry.path().strip_prefix(&ignore_root) {
             Ok(rel) if rel.as_os_str().is_empty() => true,
-            Ok(rel) => !custom_ignored(rel, &ignore_patterns),
+            Ok(rel) => !matches_compiled_ignores(rel, &rules),
             Err(_) => false,
         });
 
-        // Add custom .02agentignore if it exists
         let agent_ignore = self.root.join(".02agentignore");
         if agent_ignore.exists() {
             builder.add_custom_ignore_filename(".02agentignore");
         }
 
-        let max_bytes = self.config.max_file_size_kb * 1024;
-        let mut scanned = Vec::new();
-
+        let mut files = Vec::new();
         for result in builder.build() {
             let entry = match result {
                 Ok(e) => e,
                 Err(_) => continue,
             };
-
             let path = entry.path();
             let file_type = match entry.file_type() {
                 Some(file_type) => file_type,
                 None => continue,
             };
-            // Never follow a symlink. The real file is indexed under its own name.
             if file_type.is_symlink() || !file_type.is_file() {
                 continue;
             }
-
-            // Exclude anything inside .git
             if path.components().any(|c| c.as_os_str() == ".git") {
                 continue;
             }
-
-            // Exclude secrets by filename before opening the body.
             if self.config.exclude_secrets && SecretPattern::is_secret(path) {
                 continue;
             }
-
-            // Relative path from repo root
             let rel = match path.strip_prefix(&self.root) {
                 Ok(rel) => rel,
                 Err(_) => continue,
@@ -148,7 +208,7 @@ impl RepoScanner {
                 Some(text) => text.to_string(),
                 None => continue,
             };
-            if custom_ignored(rel, &self.config.custom_ignores) {
+            if matches_compiled_ignores(rel, &self.ignore_rules) {
                 continue;
             }
 
@@ -160,16 +220,33 @@ impl RepoScanner {
             {
                 continue;
             }
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            files.push((path.to_path_buf(), rel_path, language, kind, size));
+        }
+        files
+    }
 
-            let bytes = match read_indexed_bytes(&self.root, path, max_bytes) {
-                Ok(bytes) => bytes,
-                Err(_) => continue,
-            };
+    /// Walk repository and gather indexable files respecting gitignore, 02agentignore, and security rules.
+    pub fn scan(&self) -> Vec<ScannedFile> {
+        let max_bytes = self.config.max_file_size_kb * 1024;
+        let mut scanned = Vec::new();
+
+        for (path, rel_path, language, kind, _) in self.walk_candidate_files() {
+            let bytes =
+                match read_indexed_bytes_canon(&self.root, &self.root_canon, &path, max_bytes) {
+                    Ok(bytes) => bytes,
+                    Err(_) => continue,
+                };
             let size = bytes.len() as u64;
             let mut hasher = Sha256::new();
             hasher.update(&bytes);
             let hash = hex::encode(hasher.finalize());
-            let content = std::str::from_utf8(&bytes).ok().map(SecretPattern::redact);
+            let content = std::str::from_utf8(&bytes).ok().map(|text| {
+                match SecretPattern::redact_cow(text) {
+                    Cow::Borrowed(s) => s.to_string(),
+                    Cow::Owned(s) => s,
+                }
+            });
             let is_test = kind == FileKind::Test;
             let is_doc = kind == FileKind::Documentation;
 
@@ -187,7 +264,7 @@ impl RepoScanner {
 
             scanned.push(ScannedFile {
                 file,
-                absolute_path: path.to_path_buf(),
+                absolute_path: path,
                 content,
             });
         }

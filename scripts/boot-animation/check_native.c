@@ -67,6 +67,8 @@ int main(int argc, char **argv) {
     assert(sprite_at(sprites,2)->image);
     assert(sprite_at(sprites,1) == NULL);
     assert(number(s,"last_frame") == -1);
+    const double origin_y = -4.0;
+    assert(origin_y == -4.0);
     if (shutdown) {
         assert(number(s,"finished") == 1);
         assert(sprite_at(sprites,2)->opacity == 1);

@@ -4,20 +4,23 @@ use crate::{
     ranking::TaskKeywords,
     score::{is_entry_path, score_file, ScoreBreakdown, ScoreInput},
     types::{
-        BudgetReport, DependencyNode, EvidencePackage, GitContextSummary, RecentCommit, ScoredFile,
-        ScoredSymbol, ScoredTest,
+        BudgetReport, DependencyNode, EvidencePackage, GitContextSummary, RecentCommit, ScoredFact,
+        ScoredFile, ScoredSymbol, ScoredTest,
     },
 };
 use agent_core::{
     config::RepoConfig,
     contain::{read_indexed_bytes, validate_evidence_file},
     paths::StoragePaths,
-    types::{MemoryStatus, ReferenceKind, SecretPattern},
+    truncate_chars,
+    types::{MemoryStatus, RepoInfo, SecretPattern},
     AgentError, Result,
 };
-use agent_git::GitRepo;
-use agent_index::{IndexDatabase, RepoScanner};
-use agent_memory::{MemoryStore, StalenessEngine};
+use agent_git::{GitCommitInfo, GitRepo};
+use agent_index::{symbol_node_id, IndexDatabase, RepoScanner};
+use agent_memory::{FactStore, MemoryStore, StalenessEngine};
+use chrono::Utc;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -36,7 +39,8 @@ impl ContextCompiler {
         enforce_budget(&mut minimum)?;
         let git_repo = GitRepo::open(repo_root)?;
         let root = git_repo.root_path();
-        let max_bytes = RepoConfig::load_or_default(root).max_file_size_kb * 1024;
+        let config = RepoConfig::load_or_default(root);
+        let max_bytes = config.max_file_size_kb * 1024;
         let repo_info = git_repo.info()?;
         let repo_id = &repo_info.id;
 
@@ -63,17 +67,12 @@ impl ContextCompiler {
             .head_commit
             .clone()
             .unwrap_or_else(|| "none".to_string());
-        let short_head = if head_commit_str.len() >= 7 {
-            &head_commit_str[..7]
-        } else {
-            &head_commit_str
-        };
+        let short_head = truncate_chars(&head_commit_str, 7);
 
         let completed = db.completed_index(repo_id)?;
         let index_fresh = completed.is_some_and(|state| {
             state.head_commit == repo_info.head_commit
-                && state.fingerprint
-                    == RepoScanner::new(root, RepoConfig::load_or_default(root)).fingerprint()
+                && state.fingerprint == RepoScanner::new(root, config).fingerprint()
         });
         let staleness_str = if index_fresh {
             format!("fresh against indexed snapshot ({})", short_head)
@@ -90,10 +89,12 @@ impl ContextCompiler {
 
         // 3. Multi-signal Candidate Collection & Scoring
         let mut file_scores: HashMap<String, (f64, Vec<String>)> = HashMap::new();
-        let mut candidate_symbols: Vec<ScoredSymbol> = Vec::new();
+        let mut candidate_symbols_map: HashMap<String, ScoredSymbol> = HashMap::new();
         let mut candidate_deps: Vec<DependencyNode> = Vec::new();
+        let mut seen_deps: HashSet<(String, String, String, String, usize)> = HashSet::new();
         let mut candidate_tests: Vec<ScoredTest> = Vec::new();
-        let mut seen_symbols: HashSet<String> = HashSet::new();
+        let mut seen_tests: HashMap<(String, Option<String>), usize> = HashMap::new();
+        let mut queried_symbol_ids: HashSet<String> = HashSet::new();
 
         // Signal A: Working tree diff
         let diff_set: HashSet<&str> = scored_diffs.iter().map(|s| s.as_str()).collect();
@@ -103,21 +104,34 @@ impl ContextCompiler {
             entry.1.push("modified in working tree".to_string());
         }
 
-        // Signal B: Exact & partial symbol match
+        // Signal B: Exact & partial symbol match (deduplicated per symbol ID within each term)
         for term in &keywords.terms {
-            let mut matched_syms = Vec::new();
+            let mut term_matches: HashMap<String, (agent_core::Symbol, f64, String)> =
+                HashMap::new();
             if let Ok(syms) = db.find_symbols_by_name(repo_id, term) {
                 for s in syms {
-                    matched_syms.push((s, 10.0, "exact symbol match in task".to_string()));
+                    term_matches.insert(
+                        s.id.clone(),
+                        (s, 10.0, "exact symbol match in task".to_string()),
+                    );
                 }
             }
             if let Ok(syms) = db.search_symbols(repo_id, term, 25) {
                 for s in syms {
-                    matched_syms.push((s, 7.0, format!("partial symbol match with '{}'", term)));
+                    term_matches.entry(s.id.clone()).or_insert_with(|| {
+                        (s, 7.0, format!("partial symbol match with '{}'", term))
+                    });
                 }
             }
 
-            for (sym, base_score, reason) in matched_syms {
+            let mut ordered_matches: Vec<_> = term_matches.into_values().collect();
+            ordered_matches.sort_by(|a, b| {
+                b.1.total_cmp(&a.1)
+                    .then_with(|| a.0.file_path.cmp(&b.0.file_path))
+                    .then_with(|| a.0.start_line.cmp(&b.0.start_line))
+            });
+
+            for (sym, base_score, reason) in ordered_matches {
                 if SecretPattern::is_secret(Path::new(&sym.file_path)) {
                     continue;
                 }
@@ -129,29 +143,54 @@ impl ContextCompiler {
                     reasons.push("symbol in dirty working-tree file".to_string());
                 }
 
-                // Boost file containing this symbol
                 let entry = file_scores
                     .entry(sym.file_path.clone())
                     .or_insert((0.0, Vec::new()));
                 entry.0 += sym_score;
                 entry.1.push(format!("defines symbol '{}'", sym.name));
 
-                if seen_symbols.insert(sym.id.to_string()) {
-                    candidate_symbols.push(ScoredSymbol {
-                        symbol: sym.clone(),
-                        score: sym_score,
-                        reasons,
-                    });
+                if let Some(existing) = candidate_symbols_map.get_mut(&sym.id) {
+                    if sym_score > existing.score {
+                        existing.score = sym_score;
+                    }
+                    for r in reasons {
+                        if !existing.reasons.contains(&r) {
+                            existing.reasons.push(r);
+                        }
+                    }
+                } else {
+                    candidate_symbols_map.insert(
+                        sym.id.clone(),
+                        ScoredSymbol {
+                            symbol: sym.clone(),
+                            score: sym_score,
+                            reasons,
+                        },
+                    );
                 }
 
-                // Signal C: Dependencies & callers
-                if let Ok(deps) = db.find_symbol_deps(repo_id, &sym.name) {
+                if !queried_symbol_ids.insert(sym.id.clone()) {
+                    continue;
+                }
+
+                // Signal C: Dependencies & callers (queried by scoped qualified_name)
+                if let Ok(deps) = db.find_symbol_deps(repo_id, &sym.qualified_name) {
                     for r in deps.callers {
                         let caller_file = r.source_file.clone();
                         let caller_name = r
                             .source_symbol_name
                             .clone()
                             .unwrap_or_else(|| "<top-level>".to_string());
+                        let dep_key = (
+                            caller_name.clone(),
+                            sym.name.clone(),
+                            r.kind.to_string(),
+                            caller_file.clone(),
+                            r.line_number,
+                        );
+                        if !seen_deps.insert(dep_key) {
+                            continue;
+                        }
 
                         let entry = file_scores
                             .entry(caller_file.clone())
@@ -171,6 +210,18 @@ impl ContextCompiler {
                     }
 
                     for r in deps.callees {
+                        let rel = r.kind.to_string();
+                        let dep_key = (
+                            sym.name.clone(),
+                            r.target_name.clone(),
+                            rel.clone(),
+                            r.source_file.clone(),
+                            r.line_number,
+                        );
+                        if !seen_deps.insert(dep_key) {
+                            continue;
+                        }
+
                         let entry = file_scores
                             .entry(r.source_file.clone())
                             .or_insert((0.0, Vec::new()));
@@ -180,16 +231,28 @@ impl ContextCompiler {
                         candidate_deps.push(DependencyNode {
                             caller: sym.name.clone(),
                             callee: r.target_name,
-                            relationship: r.kind.to_string(),
+                            relationship: rel,
                             file_path: r.source_file,
                             line: r.line_number,
                         });
                     }
                 }
 
-                // Signal D: Relevant tests
+                // Signal D: Relevant tests (deduplicated per test function, preferring non-self target)
                 if let Ok(tests) = db.find_tests_for_symbol(repo_id, &sym.name) {
                     for t in tests {
+                        let key = (t.source_file.clone(), t.source_symbol_name.clone());
+                        if let Some(&idx) = seen_tests.get(&key) {
+                            let existing = &mut candidate_tests[idx];
+                            let existing_is_self = existing.test_name.as_deref()
+                                == Some(existing.target_symbol.as_str());
+                            let candidate_is_self =
+                                t.source_symbol_name.as_deref() == Some(sym.name.as_str());
+                            if existing_is_self && !candidate_is_self {
+                                existing.target_symbol = sym.name.clone();
+                            }
+                            continue;
+                        }
                         let test_file = t.source_file.clone();
                         let entry = file_scores
                             .entry(test_file.clone())
@@ -197,6 +260,8 @@ impl ContextCompiler {
                         entry.0 += 6.0;
                         entry.1.push(format!("tests symbol '{}'", sym.name));
 
+                        let idx = candidate_tests.len();
+                        seen_tests.insert(key, idx);
                         candidate_tests.push(ScoredTest {
                             test_file,
                             test_name: t.source_symbol_name,
@@ -204,6 +269,63 @@ impl ContextCompiler {
                             score: 6.0,
                         });
                     }
+                }
+            }
+        }
+
+        let mut candidate_symbols: Vec<ScoredSymbol> =
+            candidate_symbols_map.into_values().collect();
+        candidate_symbols.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.symbol.file_path.cmp(&b.symbol.file_path))
+                .then_with(|| a.symbol.start_line.cmp(&b.symbol.start_line))
+        });
+
+        // Signal B2: 1-2 hop GraphStore neighbor expansion from top seed symbols (#155)
+        if !candidate_symbols.is_empty() {
+            if let Ok(Some(dataset_id)) = db.find_dataset(repo_id, "default") {
+                let sym_prefix = format!("symbol:{dataset_id}:");
+                let file_prefix = format!("file:{dataset_id}:");
+                let mut hop_boosts: HashMap<String, usize> = HashMap::new();
+                let mut reached_sym_ids: HashMap<String, usize> = HashMap::new();
+                for seed in candidate_symbols.iter().take(5) {
+                    let start = symbol_node_id(&dataset_id, &seed.symbol.id);
+                    if let Ok(reached) = db.traverse(&dataset_id, &start, 2) {
+                        for (node_id, depth) in reached {
+                            if depth == 0 {
+                                continue;
+                            }
+                            if let Some(rel_path) = node_id.strip_prefix(&file_prefix) {
+                                let entry = hop_boosts.entry(rel_path.to_string()).or_insert(depth);
+                                *entry = (*entry).min(depth);
+                            } else if let Some(sym_id) = node_id.strip_prefix(&sym_prefix) {
+                                let entry =
+                                    reached_sym_ids.entry(sym_id.to_string()).or_insert(depth);
+                                *entry = (*entry).min(depth);
+                            }
+                        }
+                    }
+                }
+                if !reached_sym_ids.is_empty() {
+                    let sym_id_list: Vec<String> = reached_sym_ids.keys().cloned().collect();
+                    if let Ok(neighbor_syms) = db.find_symbols_by_ids(repo_id, &sym_id_list) {
+                        for sym in neighbor_syms {
+                            if let Some(&depth) = reached_sym_ids.get(&sym.id) {
+                                let entry = hop_boosts.entry(sym.file_path).or_insert(depth);
+                                *entry = (*entry).min(depth);
+                            }
+                        }
+                    }
+                }
+                for (path, depth) in hop_boosts {
+                    if SecretPattern::is_secret(Path::new(&path)) {
+                        continue;
+                    }
+                    let boost = if depth == 1 { 3.0 } else { 1.5 };
+                    let entry = file_scores.entry(path).or_insert((0.0, Vec::new()));
+                    entry.0 += boost;
+                    entry.1.push(format!("graph neighbor (hop {depth})"));
                 }
             }
         }
@@ -272,36 +394,85 @@ impl ContextCompiler {
             }
         }
 
-        // Signal G: Recent commits touching relevant files
+        // Signal F2: Non-expired git-anchored facts weighted by effective_confidence (#155)
+        let mut relevant_facts: Vec<ScoredFact> = Vec::new();
+        if let Ok(facts_path) = StoragePaths::repo_facts_path(repo_id) {
+            if facts_path.is_file() {
+                if let Ok(fact_store) = FactStore::open(&facts_path) {
+                    let now = Utc::now();
+                    if let Ok(facts) = fact_store.list(repo_id.as_str()) {
+                        for fact in facts {
+                            if SecretPattern::is_secret(Path::new(&fact.relative_path)) {
+                                continue;
+                            }
+                            let eff = fact_store.effective_confidence(&fact, now);
+                            if eff <= 0.05 {
+                                continue;
+                            }
+                            let claim_lower = fact.claim.to_lowercase();
+                            let path_lower = fact.relative_path.to_lowercase();
+                            let sym_lower = fact.symbol.as_deref().unwrap_or("").to_lowercase();
+                            let matched = file_scores.contains_key(&fact.relative_path)
+                                || keywords.terms.iter().any(|term| {
+                                    claim_lower.contains(term)
+                                        || path_lower.contains(term)
+                                        || sym_lower.contains(term)
+                                });
+                            if !matched {
+                                continue;
+                            }
+                            let entry = file_scores
+                                .entry(fact.relative_path.clone())
+                                .or_insert((0.0, Vec::new()));
+                            entry.0 += 3.0 * eff;
+                            entry
+                                .1
+                                .push(format!("anchored fact (confidence {:.2})", eff));
+                            relevant_facts.push(ScoredFact {
+                                id: fact.id,
+                                claim: match SecretPattern::redact_cow(&fact.claim) {
+                                    Cow::Borrowed(s) => s.to_string(),
+                                    Cow::Owned(s) => s,
+                                },
+                                relative_path: fact.relative_path,
+                                symbol: fact.symbol,
+                                effective_confidence: eff,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        relevant_facts.sort_by(|a, b| {
+            b.effective_confidence
+                .total_cmp(&a.effective_confidence)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        relevant_facts.truncate(10);
+
+        // Signal G: Recent commits touching relevant files (reused by rank_with_handles below)
         let all_recent = git_repo.get_recent_commits(15).unwrap_or_default();
         let mut relevant_commits = Vec::new();
-        for c in all_recent {
+        for c in &all_recent {
             relevant_commits.push(RecentCommit {
-                commit_id: c.id,
+                commit_id: c.id.clone(),
                 author: SecretPattern::redact(&c.author),
                 summary: SecretPattern::redact(&c.summary),
                 timestamp: c.timestamp,
             });
         }
 
-        // Sort by the locked compile score. Rank breaks ties, then the path.
+        // Sort by the locked compile score. Rank breaks ties using already-open handles (#161).
         let mut sorted_files: Vec<(String, f64, Vec<String>)> = file_scores
             .into_iter()
             .map(|(path, (score, reasons))| (path, score, reasons))
             .collect();
-        let rank_totals = Self::rank(root, task)
+        let rank_totals = rank_with_handles(&git_repo, &db, &repo_info, task, &all_recent)
             .unwrap_or_default()
             .into_iter()
             .map(|row| (row.path, row.total))
             .collect();
         order_compiled_files(&mut sorted_files, &rank_totals);
-
-        // Sort symbols by score descending
-        candidate_symbols.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
 
         // 4. Token Budget Allocation & Snippet Generation
         let mut budget_manager = BudgetManager::new(token_budget);
@@ -310,6 +481,9 @@ impl ContextCompiler {
         let mut base_metadata = format!("# {}\n{}\n{}", task, staleness_str, head_commit_str);
         for m in &relevant_memories {
             base_metadata.push_str(&m.claim);
+        }
+        for f in &relevant_facts {
+            base_metadata.push_str(&f.claim);
         }
         for d in &candidate_deps {
             base_metadata.push_str(&d.caller);
@@ -382,7 +556,11 @@ impl ContextCompiler {
         candidate_symbols.truncate(12);
         for scored in &mut candidate_symbols {
             if let Some(signature) = scored.symbol.signature.as_mut() {
-                *signature = bound_text(&SecretPattern::redact(signature), 64);
+                *signature = bound_text(&SecretPattern::redact_cow(signature), 64);
+            }
+            if let Some(doc) = scored.symbol.doc_comment.as_mut() {
+                let redacted = SecretPattern::redact_cow(doc);
+                *doc = truncate_chars(redacted.trim(), 200).to_string();
             }
         }
         candidate_deps.truncate(10);
@@ -413,6 +591,7 @@ impl ContextCompiler {
             dependencies: candidate_deps,
             verified_memories: relevant_memories,
             diagnostic_memories,
+            relevant_facts,
             git_context: git_summary,
             budget: budget_report,
         };
@@ -427,102 +606,101 @@ impl ContextCompiler {
     pub fn rank<P: AsRef<Path>>(repo_root: P, task: &str) -> Result<Vec<ScoreBreakdown>> {
         let git_repo = GitRepo::open(repo_root)?;
         let repo_info = git_repo.info()?;
-        let repo_id = &repo_info.id;
-        let db_path = StoragePaths::repo_db_path(repo_id)?;
+        let db_path = StoragePaths::repo_db_path(&repo_info.id)?;
         if !db_path.exists() {
             return Err(AgentError::General(
                 "Repository is not indexed yet. Run '02 init' or '02 index' first.".to_string(),
             ));
         }
         let db = IndexDatabase::open(&db_path)?;
-        let keywords = TaskKeywords::parse(task);
-        let mut exact_ids = HashSet::new();
-        let mut exact_counts: HashMap<String, usize> = HashMap::new();
-        let mut partial_counts: HashMap<String, usize> = HashMap::new();
-        for term in &keywords.terms {
-            if let Ok(symbols) = db.find_symbols_by_name(repo_id, term) {
-                for symbol in symbols {
-                    exact_ids.insert(symbol.id.clone());
+        let recent_commits = git_repo.get_recent_commits(15).unwrap_or_default();
+        rank_with_handles(&git_repo, &db, &repo_info, task, &recent_commits)
+    }
+}
+
+fn rank_with_handles(
+    git_repo: &GitRepo,
+    db: &IndexDatabase,
+    repo_info: &RepoInfo,
+    task: &str,
+    recent_commits: &[GitCommitInfo],
+) -> Result<Vec<ScoreBreakdown>> {
+    let repo_id = &repo_info.id;
+    let keywords = TaskKeywords::parse(task);
+    let mut exact_ids = HashSet::new();
+    let mut exact_counts: HashMap<String, usize> = HashMap::new();
+    let mut partial_counts: HashMap<String, usize> = HashMap::new();
+    for term in &keywords.terms {
+        if let Ok(symbols) = db.find_symbols_by_name(repo_id, term) {
+            for symbol in symbols {
+                if exact_ids.insert(symbol.id.clone()) {
                     *exact_counts.entry(symbol.file_path).or_insert(0) += 1;
                 }
             }
-            if let Ok(symbols) = db.search_symbols(repo_id, term, 25) {
-                for symbol in symbols {
-                    if exact_ids.contains(&symbol.id) {
-                        continue;
-                    }
-                    *partial_counts.entry(symbol.file_path).or_insert(0) += 1;
+        }
+        if let Ok(symbols) = db.search_symbols(repo_id, term, 25) {
+            for symbol in symbols {
+                if exact_ids.contains(&symbol.id) {
+                    continue;
                 }
+                *partial_counts.entry(symbol.file_path).or_insert(0) += 1;
             }
         }
-
-        let mut tested_files = HashSet::new();
-        if let Ok(references) = db.list_references(repo_id.as_str()) {
-            let symbols = db.list_symbols(repo_id.as_str()).unwrap_or_default();
-            let symbol_files: HashMap<&str, &str> = symbols
-                .iter()
-                .map(|symbol| (symbol.name.as_str(), symbol.file_path.as_str()))
-                .collect();
-            for reference in &references {
-                if reference.kind == ReferenceKind::Tests {
-                    if let Some(path) = symbol_files.get(reference.target_name.as_str()) {
-                        tested_files.insert((*path).to_string());
-                    }
-                }
-            }
-        }
-
-        let mut touches: HashMap<String, usize> = HashMap::new();
-        if let Ok(commits) = git_repo.get_recent_commits(15) {
-            for commit in commits {
-                if let Ok(paths) = git_repo.paths_touched_by_commit(&commit.id) {
-                    for path in paths {
-                        *touches.entry(path).or_insert(0) += 1;
-                    }
-                }
-            }
-        }
-        let completed = db.completed_index(repo_id)?;
-        let index_stale =
-            !completed.is_some_and(|state| state.head_commit == repo_info.head_commit);
-
-        let mut ranked = Vec::new();
-        for file in db.list_files(repo_id)? {
-            if SecretPattern::is_secret(Path::new(&file.relative_path)) {
-                continue;
-            }
-            let test_distance = if file.is_test
-                && (exact_counts.contains_key(&file.relative_path)
-                    || partial_counts.contains_key(&file.relative_path))
-            {
-                Some(0)
-            } else if tested_files.contains(&file.relative_path) {
-                Some(1)
-            } else {
-                None
-            };
-            ranked.push(score_file(&ScoreInput {
-                path: &file.relative_path,
-                exact_symbols: exact_counts.get(&file.relative_path).copied().unwrap_or(0),
-                partial_symbols: partial_counts
-                    .get(&file.relative_path)
-                    .copied()
-                    .unwrap_or(0),
-                test_distance,
-                commits_touching: touches.get(&file.relative_path).copied().unwrap_or(0),
-                kind: &file.kind.to_string(),
-                is_entry: is_entry_path(&file.relative_path),
-                index_stale,
-            }));
-        }
-        ranked.sort_by(|left, right| {
-            right
-                .total
-                .total_cmp(&left.total)
-                .then_with(|| left.path.cmp(&right.path))
-        });
-        Ok(ranked)
     }
+
+    let tested_files: HashSet<String> = db
+        .list_tested_file_paths(repo_id)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    let mut touches: HashMap<String, usize> = HashMap::new();
+    for commit in recent_commits {
+        if let Ok(paths) = git_repo.paths_touched_by_commit(&commit.id) {
+            for path in paths {
+                *touches.entry(path).or_insert(0) += 1;
+            }
+        }
+    }
+    let completed = db.completed_index(repo_id)?;
+    let index_stale = !completed.is_some_and(|state| state.head_commit == repo_info.head_commit);
+
+    let mut ranked = Vec::new();
+    for file in db.list_files(repo_id)? {
+        if SecretPattern::is_secret(Path::new(&file.relative_path)) {
+            continue;
+        }
+        let test_distance = if file.is_test
+            && (exact_counts.contains_key(&file.relative_path)
+                || partial_counts.contains_key(&file.relative_path))
+        {
+            Some(0)
+        } else if tested_files.contains(&file.relative_path) {
+            Some(1)
+        } else {
+            None
+        };
+        ranked.push(score_file(&ScoreInput {
+            path: &file.relative_path,
+            exact_symbols: exact_counts.get(&file.relative_path).copied().unwrap_or(0),
+            partial_symbols: partial_counts
+                .get(&file.relative_path)
+                .copied()
+                .unwrap_or(0),
+            test_distance,
+            commits_touching: touches.get(&file.relative_path).copied().unwrap_or(0),
+            kind: &file.kind.to_string(),
+            is_entry: is_entry_path(&file.relative_path),
+            index_stale,
+        }));
+    }
+    ranked.sort_by(|left, right| {
+        right
+            .total
+            .total_cmp(&left.total)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(ranked)
 }
 
 fn empty_package(task: &str, token_budget: usize) -> EvidencePackage {
@@ -536,6 +714,7 @@ fn empty_package(task: &str, token_budget: usize) -> EvidencePackage {
         dependencies: Vec::new(),
         verified_memories: Vec::new(),
         diagnostic_memories: Vec::new(),
+        relevant_facts: Vec::new(),
         git_context: GitContextSummary {
             head_commit: None,
             branch: None,
@@ -554,11 +733,7 @@ fn empty_package(task: &str, token_budget: usize) -> EvidencePackage {
 
 fn bound_text(text: &str, max_tokens: usize) -> String {
     let max_chars = max_tokens.saturating_mul(4);
-    let mut end = text.len().min(max_chars);
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_string()
+    truncate_chars(text, max_chars).to_string()
 }
 
 fn payload_tokens(package: &EvidencePackage) -> usize {
@@ -589,6 +764,7 @@ fn removable_items(package: &EvidencePackage) -> usize {
         + package.git_context.recent_commits.len()
         + package.verified_memories.len()
         + package.diagnostic_memories.len()
+        + package.relevant_facts.len()
         + package.dependencies.len()
         + package.relevant_tests.len()
         + usize::from(!package.git_context.modified_files.is_empty())
@@ -619,6 +795,7 @@ fn drop_budget_items(package: &mut EvidencePackage, mut count: usize) {
     trim!(package.git_context.recent_commits);
     trim!(package.verified_memories);
     trim!(package.diagnostic_memories);
+    trim!(package.relevant_facts);
     trim!(package.dependencies);
     trim!(package.relevant_tests);
     if count > 0 {

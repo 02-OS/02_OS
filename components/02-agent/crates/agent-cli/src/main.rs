@@ -152,6 +152,18 @@ enum Commands {
 
     #[command(about = "Serve a loopback page of agents, token counts, approvals, and evidence")]
     Dashboard,
+
+    #[command(about = "Inspect recorded and pending tool approvals (Phase 6)")]
+    Approval,
+
+    #[command(about = "List compiled and verified evidence package digests (Phase 6)")]
+    Evidence,
+
+    #[command(about = "List or verify local agent skills and tool allowlists (Phase 6)")]
+    Skill {
+        #[command(subcommand)]
+        sub: SkillCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -177,6 +189,17 @@ enum MemoryCommands {
     Inspect { id: String },
     #[command(about = "Verify freshness of a memory against current Git HEAD")]
     Verify { id: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillCommands {
+    #[command(about = "List discovered skills in the repository")]
+    List,
+    #[command(about = "Verify a skill directory and its tool allowlist")]
+    Verify {
+        #[arg(help = "Path to the skill directory (default: current directory)")]
+        path: Option<std::path::PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -219,6 +242,14 @@ fn main() -> ExitCode {
         Commands::Serve => commands::serve::execute(),
         Commands::Gc => commands::gc::execute(cli.json),
         Commands::Dashboard => commands::dashboard::execute(),
+        Commands::Approval => commands::telemetry::execute_approvals(cli.json),
+        Commands::Evidence => commands::telemetry::execute_evidence(cli.json),
+        Commands::Skill { sub } => match sub {
+            SkillCommands::List => commands::telemetry::execute_skill_list(cli.json),
+            SkillCommands::Verify { path } => {
+                commands::telemetry::execute_skill_verify(path.as_deref(), cli.json)
+            }
+        },
     };
 
     match result {

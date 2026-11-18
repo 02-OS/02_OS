@@ -1,9 +1,13 @@
-use agent_core::{error::AgentError, paths::StoragePaths, Result};
+mod dbus_atspi;
+
+use agent_core::{
+    contain::write_private_atomic, error::AgentError, paths::StoragePaths, Result, SecretPattern,
+};
+use chrono::Utc;
 use serde_json::{json, Value};
-use std::fs;
-use std::io::ErrorKind;
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
+use std::fs::OpenOptions;
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Local files that arm or stop desktop automation. Both stay mode `0600`.
@@ -16,18 +20,7 @@ pub fn kill_path() -> Result<PathBuf> {
 }
 
 fn write_private(path: &Path, body: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            StoragePaths::ensure_private_dir(parent)?;
-        }
-    }
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, body)?;
-    let mut permissions = fs::metadata(&temporary)?.permissions();
-    permissions.set_mode(0o600);
-    fs::set_permissions(&temporary, permissions)?;
-    fs::rename(&temporary, path)?;
-    Ok(())
+    write_private_atomic(path, body.as_bytes())
 }
 
 /// Explicit consent. The file must contain the word `allow`.
@@ -40,23 +33,34 @@ pub fn write_kill(path: &Path) -> Result<()> {
     write_private(path, "stop\n")
 }
 
-/// Refuse the call unless consent is private and says `allow`, and the kill file is absent.
+/// Refuse the call unless consent is an `0600` regular file (`O_NOFOLLOW | O_NONBLOCK`)
+/// saying `allow`, and the kill file is absent.
 pub fn authorize(consent: &Path, kill: &Path) -> Result<()> {
     if kill.symlink_metadata().is_ok() {
         return Err(AgentError::Security("desktop automation is stopped".into()));
     }
-    let metadata = match consent.symlink_metadata() {
-        Ok(metadata) => metadata,
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(consent)
+    {
+        Ok(file) => file,
         Err(err) if err.kind() == ErrorKind::NotFound => {
             return Err(AgentError::Security(
                 "desktop automation requires consent".into(),
             ));
         }
+        Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(AgentError::Security(
+                "desktop consent file must not be a symlink".into(),
+            ));
+        }
         Err(err) => return Err(err.into()),
     };
-    if metadata.file_type().is_symlink() {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
         return Err(AgentError::Security(
-            "desktop consent file must not be a symlink".into(),
+            "desktop consent file must be a regular file".into(),
         ));
     }
     let mode = metadata.permissions().mode() & 0o777;
@@ -65,7 +69,8 @@ pub fn authorize(consent: &Path, kill: &Path) -> Result<()> {
             "desktop consent file must be mode 0600".into(),
         ));
     }
-    let text = fs::read_to_string(consent)?;
+    let mut text = String::new();
+    file.take(1024).read_to_string(&mut text)?;
     let allowed = text.split_whitespace().any(|word| word == "allow");
     if !allowed {
         return Err(AgentError::Security(
@@ -82,12 +87,15 @@ pub struct DesktopWindow {
     pub focused: bool,
 }
 
-/// Accessibility tree used by desktop tools. The live process does not implement this.
+/// Accessibility tree used by desktop tools.
 pub trait AccessibilityTree {
     fn list_windows(&self) -> Result<Vec<DesktopWindow>>;
     fn focused_window(&self) -> Result<Option<DesktopWindow>>;
     fn click(&mut self, id: &str) -> Result<()>;
     fn type_text(&mut self, id: &str, text: &str) -> Result<()>;
+    fn key_press(&mut self, id: &str, key: &str) -> Result<()>;
+    fn scroll(&mut self, id: &str, direction: &str, amount: i64) -> Result<()>;
+    fn inspect_element(&self, id: &str) -> Result<Value>;
 }
 
 /// In-memory tree for tests and for any caller that supplies its own windows.
@@ -122,62 +130,86 @@ impl AccessibilityTree for FakeTree {
         self.typed.push((id.to_string(), text.to_string()));
         Ok(())
     }
+
+    fn key_press(&mut self, id: &str, key: &str) -> Result<()> {
+        if !self.windows.iter().any(|window| window.id == id) {
+            return Err(AgentError::General(format!("unknown window {id}")));
+        }
+        self.clicks.push(format!("{id}:key:{key}"));
+        Ok(())
+    }
+
+    fn scroll(&mut self, id: &str, direction: &str, amount: i64) -> Result<()> {
+        if !self.windows.iter().any(|window| window.id == id) {
+            return Err(AgentError::General(format!("unknown window {id}")));
+        }
+        self.clicks
+            .push(format!("{id}:scroll:{direction}:{amount}"));
+        Ok(())
+    }
+
+    fn inspect_element(&self, id: &str) -> Result<Value> {
+        let win = self
+            .windows
+            .iter()
+            .find(|window| window.id == id)
+            .ok_or_else(|| AgentError::General(format!("unknown window {id}")))?;
+        Ok(json!({
+            "id": win.id,
+            "title": SecretPattern::redact(&win.title),
+            "focused": win.focused
+        }))
+    }
 }
 
-/// Fail closed. A session bus is probed and then refused: this binary links no AT-SPI toolkit,
-/// sends no input events, and opens no network connection.
+/// Probe a local session bus socket (`;`-delimited multi-transport aware).
 pub fn probe_session_bus(address: Option<&str>) -> Result<()> {
-    let Some(address) = address.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Err(AgentError::General(
-            "desktop automation found no session bus".into(),
-        ));
-    };
-    let path = address.split(',').find_map(|part| {
-        let part = part.trim();
-        part.strip_prefix("unix:path=")
-            .or_else(|| part.strip_prefix("unix:abstract="))
-    });
-    let Some(path) = path else {
-        return Err(AgentError::General(
-            "session bus address is not a local socket".into(),
-        ));
-    };
-    if path.contains("..") || path.contains('\0') {
-        return Err(AgentError::Security("session bus path is not local".into()));
-    }
-    if address.contains("unix:abstract=") {
-        return Err(AgentError::General(
-            "desktop automation does not use an abstract session bus".into(),
-        ));
-    }
-    UnixStream::connect(path)
-        .map_err(|err| AgentError::General(format!("session bus is not reachable: {err}")))?;
-    Err(AgentError::General(
-        "AT-SPI tree is not available to this process".into(),
-    ))
+    dbus_atspi::probe_bus_or_unavailable(address)
 }
 
 pub struct SessionTree;
 
 impl AccessibilityTree for SessionTree {
     fn list_windows(&self) -> Result<Vec<DesktopWindow>> {
-        probe_session_bus(std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref())?;
-        Ok(Vec::new())
+        let entries = dbus_atspi::session_list_windows(
+            std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref(),
+        )?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| DesktopWindow {
+                id: entry.id,
+                title: entry.title,
+                focused: entry.focused,
+            })
+            .collect())
     }
 
     fn focused_window(&self) -> Result<Option<DesktopWindow>> {
-        probe_session_bus(std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref())?;
-        Ok(None)
+        let windows = self.list_windows()?;
+        Ok(windows.into_iter().find(|window| window.focused))
     }
 
     fn click(&mut self, _id: &str) -> Result<()> {
-        probe_session_bus(std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref())?;
-        Ok(())
+        probe_session_bus(std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref())
     }
 
     fn type_text(&mut self, _id: &str, _text: &str) -> Result<()> {
-        probe_session_bus(std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref())?;
-        Ok(())
+        probe_session_bus(std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref())
+    }
+
+    fn key_press(&mut self, _id: &str, _key: &str) -> Result<()> {
+        probe_session_bus(std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref())
+    }
+
+    fn scroll(&mut self, _id: &str, _direction: &str, _amount: i64) -> Result<()> {
+        probe_session_bus(std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref())
+    }
+
+    fn inspect_element(&self, id: &str) -> Result<Value> {
+        dbus_atspi::session_inspect_element(
+            std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref(),
+            id,
+        )
     }
 }
 
@@ -205,7 +237,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "desktop_type",
-            "description": "Type text into a window id from the accessibility tree. The text is not echoed back.",
+            "description": "Type text into a window id from the accessibility tree. The text is not echoed back or logged.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -215,8 +247,73 @@ pub fn tool_definitions() -> Value {
                 "required": ["id", "text"],
                 "additionalProperties": false
             }
+        },
+        {
+            "name": "desktop_key_press",
+            "description": "Send a single validated key symbol to a window id from the accessibility tree.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "key": { "type": "string" }
+                },
+                "required": ["id", "key"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "desktop_scroll",
+            "description": "Scroll within a window id by a bounded direction and step count.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "direction": { "type": "string", "enum": ["up", "down", "left", "right"] },
+                    "amount": { "type": "integer", "minimum": 1, "maximum": 100 }
+                },
+                "required": ["id", "direction"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "desktop_element_inspect",
+            "description": "Inspect redacted metadata for an accessibility element id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"],
+                "additionalProperties": false
+            }
         }
     ])
+}
+
+fn append_audit_log(consent: &Path, tool: &str, target_id: Option<&str>, ok: bool) {
+    let Some(dir) = consent.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return;
+    };
+    let log_path = dir.join("desktop-audit.jsonl");
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&log_path)
+    else {
+        return;
+    };
+    if let Ok(meta) = file.metadata() {
+        if !meta.file_type().is_file() {
+            return;
+        }
+    }
+    let entry = json!({
+        "ts": Utc::now().to_rfc3339(),
+        "tool": tool,
+        "id": target_id,
+        "ok": ok
+    });
+    let _ = writeln!(file, "{entry}");
 }
 
 /// One desktop tool call. Consent and the kill switch are checked before the tree is touched.
@@ -228,7 +325,8 @@ pub fn call_tool<T: AccessibilityTree>(
     arguments: &Value,
 ) -> Result<Value> {
     authorize(consent, kill)?;
-    match name {
+    let target_id = arguments.get("id").and_then(Value::as_str);
+    let outcome = match name {
         "desktop_list_windows" => {
             let windows = tree.list_windows()?;
             Ok(json!({ "windows": windows.iter().map(window_json).collect::<Vec<_>>() }))
@@ -248,14 +346,50 @@ pub fn call_tool<T: AccessibilityTree>(
             tree.type_text(id, text)?;
             Ok(json!({ "typed": true }))
         }
+        "desktop_key_press" => {
+            let id = required_str(arguments, "id")?;
+            let key = required_str(arguments, "key")?;
+            if key.len() > 64
+                || !key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'))
+            {
+                return Err(AgentError::General("invalid key symbol".into()));
+            }
+            tree.key_press(id, key)?;
+            Ok(json!({ "key_pressed": key }))
+        }
+        "desktop_scroll" => {
+            let id = required_str(arguments, "id")?;
+            let direction = required_str(arguments, "direction")?;
+            if !matches!(direction, "up" | "down" | "left" | "right") {
+                return Err(AgentError::General(
+                    "scroll direction must be up, down, left, or right".into(),
+                ));
+            }
+            let amount = arguments.get("amount").and_then(Value::as_i64).unwrap_or(1);
+            if !(1..=100).contains(&amount) {
+                return Err(AgentError::General(
+                    "scroll amount must be in 1..=100".into(),
+                ));
+            }
+            tree.scroll(id, direction, amount)?;
+            Ok(json!({ "scrolled": direction, "amount": amount }))
+        }
+        "desktop_element_inspect" => {
+            let id = required_str(arguments, "id")?;
+            tree.inspect_element(id)
+        }
         _ => Err(AgentError::General(format!("unknown desktop tool {name}"))),
-    }
+    };
+    append_audit_log(consent, name, target_id, outcome.is_ok());
+    outcome
 }
 
 fn window_json(window: &DesktopWindow) -> Value {
     json!({
         "id": window.id,
-        "title": window.title,
+        "title": SecretPattern::redact(&window.title),
         "focused": window.focused
     })
 }
@@ -268,16 +402,43 @@ fn required_str<'a>(arguments: &'a Value, key: &str) -> Result<&'a str> {
         .ok_or_else(|| AgentError::General(format!("desktop tool requires {key}")))
 }
 
-/// JSON-RPC tools/list and tools/call. Notifications and unknown methods get no side effects.
+/// JSON-RPC 2.0 `initialize`, `tools/list`, and `tools/call`. Validates envelope strictly.
 pub fn handle_message<T: AccessibilityTree>(
     consent: &Path,
     kill: &Path,
     tree: &mut T,
     message: &Value,
 ) -> Option<Value> {
-    message.get("id")?;
-    let id = message.get("id").cloned().unwrap_or(Value::Null);
-    let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+    let Some(obj) = message.as_object() else {
+        return Some(json!({
+            "jsonrpc": "2.0",
+            "id": Value::Null,
+            "error": { "code": -32600, "message": "Invalid Request" }
+        }));
+    };
+    let has_id = obj.contains_key("id");
+    let id = obj.get("id").cloned().unwrap_or(Value::Null);
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Some(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32600, "message": "Invalid Request: missing or bad jsonrpc version" }
+        }));
+    }
+    let Some(method) = obj
+        .get("method")
+        .and_then(Value::as_str)
+        .filter(|m| !m.is_empty())
+    else {
+        return Some(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32600, "message": "Invalid Request: missing method" }
+        }));
+    };
+    if !has_id {
+        return None;
+    }
     let result = match method {
         "initialize" => Ok(json!({
             "protocolVersion": "2024-11-05",
@@ -286,7 +447,7 @@ pub fn handle_message<T: AccessibilityTree>(
         })),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
         "tools/call" => {
-            let params = message.get("params").cloned().unwrap_or(json!({}));
+            let params = obj.get("params").cloned().unwrap_or(json!({}));
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
             match call_tool(consent, kill, tree, name, &arguments) {
@@ -315,6 +476,7 @@ pub fn handle_message<T: AccessibilityTree>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
 
@@ -473,5 +635,81 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("requires consent"));
+
+        let bad_rpc = handle_message(
+            &consent,
+            &kill,
+            &mut tree,
+            &json!({"id": 3, "method": "tools/list"}),
+        )
+        .unwrap();
+        assert_eq!(bad_rpc["error"]["code"], -32600);
+    }
+
+    #[test]
+    fn desktop_multi_transport_new_tools_audit_log_and_directory_reject() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("bus");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let multi = format!(
+            "unix:abstract=/tmp/fake-abs;unix:path={},guid=1",
+            socket.display()
+        );
+        let err = probe_session_bus(Some(&multi)).unwrap_err();
+        assert!(err.to_string().contains("AT-SPI tree is not available"));
+
+        let fake_dir_consent = dir.path().join("consent-dir");
+        fs::create_dir(&fake_dir_consent).unwrap();
+        fs::set_permissions(&fake_dir_consent, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(authorize(&fake_dir_consent, &dir.path().join("kill")).is_err());
+
+        let (consent, kill) = allow(dir.path());
+        let mut tree = FakeTree {
+            windows: vec![DesktopWindow {
+                id: "w1".into(),
+                title: "Term".into(),
+                focused: true,
+            }],
+            clicks: Vec::new(),
+            typed: Vec::new(),
+        };
+        call_tool(
+            &consent,
+            &kill,
+            &mut tree,
+            "desktop_type",
+            &json!({"id": "w1", "text": "top-secret-password"}),
+        )
+        .unwrap();
+        let key_res = call_tool(
+            &consent,
+            &kill,
+            &mut tree,
+            "desktop_key_press",
+            &json!({"id": "w1", "key": "Return"}),
+        )
+        .unwrap();
+        assert_eq!(key_res["key_pressed"], "Return");
+        let scroll_res = call_tool(
+            &consent,
+            &kill,
+            &mut tree,
+            "desktop_scroll",
+            &json!({"id": "w1", "direction": "down", "amount": 3}),
+        )
+        .unwrap();
+        assert_eq!(scroll_res["scrolled"], "down");
+        let insp = call_tool(
+            &consent,
+            &kill,
+            &mut tree,
+            "desktop_element_inspect",
+            &json!({"id": "w1"}),
+        )
+        .unwrap();
+        assert_eq!(insp["id"], "w1");
+        let audit = fs::read_to_string(dir.path().join("desktop-audit.jsonl")).unwrap();
+        assert!(audit.contains("desktop_key_press"));
+        assert!(!audit.contains("top-secret-password"));
     }
 }

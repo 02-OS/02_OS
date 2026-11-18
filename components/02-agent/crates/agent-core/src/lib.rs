@@ -18,7 +18,7 @@ pub use graph_model::{
 pub use paths::StoragePaths;
 pub use phase::{phase_label, publish_index_phase, require_phase, write_index_phase};
 pub use types::{
-    EvidenceItem, EvidenceMemory, FileKind, HostKind, IndexedFile, Language, LiveEnvironmentInfo,
-    MemoryKind, MemoryStatus, ReferenceKind, RepoId, RepoInfo, SecretPattern, Symbol, SymbolKind,
-    SymbolReference,
+    truncate_chars, EvidenceItem, EvidenceMemory, FileKind, HostKind, IndexedFile, Language,
+    LiveEnvironmentInfo, MemoryKind, MemoryStatus, ReferenceKind, RepoId, RepoInfo, SecretPattern,
+    Symbol, SymbolKind, SymbolReference,
 };

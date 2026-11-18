@@ -16,12 +16,14 @@
 
         <key type="d" name="friction">
             <default>3.5</default>
+            <range min="1.0" max="10.0"/>
             <summary>Friction</summary>
             <description/>
         </key>
 
         <key type="d" name="spring-k">
             <default>3.8</default>
+            <range min="1.0" max="10.0"/>
             <summary>Spring k</summary>
             <description/>
         </key>
@@ -35,18 +37,21 @@
 
         <key type="d" name="mass">
             <default>70.0</default>
+            <range min="1.0" max="99.0"/>
             <summary>Mass</summary>
             <description/>
         </key>
 
         <key type="d" name="x-tiles">
             <default>6.0</default>
+            <range min="3.0" max="20.0"/>
             <summary>X Tiles</summary>
             <description/>
         </key>
 
         <key type="d" name="y-tiles">
             <default>6.0</default>
+            <range min="3.0" max="20.0"/>
             <summary>Y Tiles</summary>
             <description/>
         </key>

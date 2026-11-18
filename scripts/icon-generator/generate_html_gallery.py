@@ -100,8 +100,6 @@ def build_gallery():
     <head>
       <meta charset="UTF-8">
       <title>02_OS — Glassmorphic Vector Icon Pack Preview</title>
-      <link rel="preconnect" href="https://fonts.googleapis.com">
-      <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
       <style>
         :root {{
           --bg: #0d0f14;
@@ -250,6 +248,26 @@ def build_gallery():
           border-radius: 6px;
           font-family: 'JetBrains Mono', monospace;
         }}
+        .toolbar {{
+          max-width: 720px;
+          margin: 24px auto 0;
+          display: flex;
+          gap: 12px;
+          justify-content: center;
+          flex-wrap: wrap;
+        }}
+        .search-input, .category-filter {{
+          background: rgba(26, 29, 38, 0.85);
+          border: 1px solid rgba(255, 255, 255, 0.14);
+          color: var(--text-main);
+          border-radius: 12px;
+          padding: 10px 14px;
+          font-size: 14px;
+          outline: none;
+        }}
+        .search-input {{
+          flex: 1 1 280px;
+        }}
       </style>
     </head>
     <body>
@@ -260,10 +278,49 @@ def build_gallery():
           A bespoke, continuous-squircle vector icon system engineered for 02_OS.
           Crafted with multi-layer depth, frosted glass sheen, specular edge rim lighting, and vibrant gradients.
         </p>
+        <div class="toolbar">
+          <input id="gallery-search-input" class="search-input" type="search" placeholder="Search icons or aliases..." aria-label="Search icons">
+          <select id="gallery-category-select" class="category-filter" aria-label="Filter by category">
+            <option value="all">All categories</option>
+            <option value="apps">Apps</option>
+            <option value="places">Places</option>
+            <option value="devices">Devices</option>
+            <option value="categories">Categories</option>
+            <option value="mimetypes">Mimetypes</option>
+            <option value="status">Status</option>
+            <option value="actions">Actions</option>
+          </select>
+        </div>
       </div>
       <div class="container">
         {"".join(sections)}
       </div>
+      <script>
+        (() => {{
+          const searchInput = document.getElementById('gallery-search-input');
+          const categorySelect = document.getElementById('gallery-category-select');
+          const sections = Array.from(document.querySelectorAll('.category-section'));
+          function applyFilter() {{
+            const query = (searchInput?.value || '').trim().toLowerCase();
+            const selectedCat = (categorySelect?.value || 'all').toLowerCase();
+            for (const section of sections) {{
+              const titleText = (section.querySelector('.category-title')?.textContent || '').trim().toLowerCase();
+              const catMatch = selectedCat === 'all' || titleText.startsWith(selectedCat);
+              let visibleCount = 0;
+              for (const card of section.querySelectorAll('.icon-card')) {{
+                const name = (card.querySelector('.icon-name')?.textContent || '').toLowerCase();
+                const aliases = Array.from(card.querySelectorAll('.alias-tag')).map(el => el.textContent.toLowerCase()).join(' ');
+                const matches = !query || name.includes(query) || aliases.includes(query);
+                card.style.display = (catMatch && matches) ? '' : 'none';
+                if (catMatch && matches) visibleCount++;
+              }}
+              section.style.display = (catMatch && visibleCount > 0) ? '' : 'none';
+            }}
+          }}
+          searchInput?.addEventListener('input', applyFilter);
+          categorySelect?.addEventListener('change', applyFilter);
+        }})();
+      </script>
     </body>
     </html>
     """

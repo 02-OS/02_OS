@@ -250,3 +250,30 @@ fn seed_names_02_os_and_uses_the_runtime_cargo_path_that_exists() {
     );
     assert!(preferred_runtime.claim.contains("components/02-agent/"));
 }
+
+#[test]
+fn memory_store_fails_closed_on_malformed_jsonl_and_writes_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("memories.jsonl");
+    fs::write(&path, "{\"not\":\"an evidence memory\"}\n").unwrap();
+    let store = MemoryStore::new(path.clone());
+    assert!(store.load_all().is_err());
+
+    let clean_path = dir.path().join("clean.jsonl");
+    let clean_store = MemoryStore::new(clean_path.clone());
+    let mem = EvidenceMemory {
+        id: "m1".into(),
+        claim: "safe".into(),
+        kind: MemoryKind::ArchitecturalFact,
+        evidence: Vec::new(),
+        valid_at: "abc".into(),
+        confidence: 1.0,
+        status: MemoryStatus::Fresh,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    clean_store.save(&mem).unwrap();
+    let mode = fs::metadata(&clean_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}

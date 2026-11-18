@@ -18,17 +18,26 @@ python3 "${SCRIPT_DIR}/source-manifest.py" "${REPO_ROOT}" --require-clean > /dev
 
 REUSE_ISO=0
 FORCE_TAG=0
+FORCE_REBUILD=0
 for arg in "$@"; do
     case "${arg}" in
         --reuse-iso) REUSE_ISO=1 ;;
         --force-tag) FORCE_TAG=1 ;;
-        --force-rebuild) ;;
+        --force-rebuild) FORCE_REBUILD=1 ;;
         *)
             echo "ERROR: unknown argument ${arg} (expected --reuse-iso, --force-tag, or --force-rebuild)" >&2
             exit 1
             ;;
     esac
 done
+export FORCE_REBUILD
+
+if [[ "${RELEASE_DRY_RUN:-}" != "1" ]]; then
+    if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+        echo "ERROR: GitHub CLI (gh) must be installed and authenticated before running a live release." >&2
+        exit 1
+    fi
+fi
 
 # ISO_PATH is global. A fresh build must be the new name, or the single ISO
 # whose bytes changed, and its completion manifest must match HEAD and bytes. Untouched older
@@ -36,6 +45,9 @@ done
 select_fresh_iso() {
     declare -A before=()
     local iso name mtime
+    if [[ "${FORCE_REBUILD}" -eq 1 && -d "${OUT_DIR}" ]]; then
+        rm -f "${OUT_DIR}"/02_OS-*.iso.part* "${OUT_DIR}/02_OS.sha256" "${OUT_DIR}/02_OS-parts.sha256"
+    fi
     if [[ -d "${OUT_DIR}" ]]; then
         while IFS= read -r iso; do
             [[ -n "${iso}" ]] || continue
@@ -45,7 +57,11 @@ select_fresh_iso() {
     fi
 
     echo "=== [Step 1/5] Building 02_OS Live ISO ==="
-    "${BUILD_SCRIPT}"
+    if [[ "${FORCE_REBUILD}" -eq 1 ]]; then
+        FORCE_REBUILD=1 "${BUILD_SCRIPT}"
+    else
+        "${BUILD_SCRIPT}"
+    fi
 
     if [[ ! -d "${OUT_DIR}" ]]; then
         echo "ERROR: build did not create ${OUT_DIR}" >&2
@@ -138,11 +154,13 @@ split -b 1400M "${ISO_NAME}" "${ISO_NAME}.part"
 # Parts checksum
 echo "Calculating sha256 for split parts..."
 sha256sum "${ISO_NAME}.part"* > "02_OS-parts.sha256"
+sha256sum -c "02_OS.sha256"
+sha256sum -c "02_OS-parts.sha256"
 
 ls -lh "${OUT_DIR}"
 
-# Step 3: Git Tag
-echo "=== [Step 3/5] Creating and Pushing Git Tag ${TAG_NAME} ==="
+# Step 3: Verify & Create Local Git Tag (push deferred until checksums and notes are ready)
+echo "=== [Step 3/5] Preparing Git Tag ${TAG_NAME} ==="
 cd "${REPO_ROOT}"
 REMOTE_TAG="$(git ls-remote origin "refs/tags/${TAG_NAME}")"
 if [[ -n "${REMOTE_TAG}" ]]; then
@@ -162,11 +180,6 @@ if git rev-parse -q --verify "refs/tags/${TAG_NAME}" >/dev/null; then
 fi
 
 git tag -a "${TAG_NAME}" -m "Release ${RELEASE_TITLE}"
-if [[ "${FORCE_TAG}" -eq 1 && -n "${REMOTE_TAG}" ]]; then
-    git push origin "${TAG_NAME}" --force
-else
-    git push origin "${TAG_NAME}"
-fi
 
 # Step 4: Prepare Release Notes
 echo "=== [Step 4/5] Preparing Release Notes ==="
@@ -227,8 +240,13 @@ sha256sum -c 02_OS-parts.sha256
 \`\`\`
 EOF
 
-# Step 5: Publish Release via gh CLI
-echo "=== [Step 5/5] Publishing GitHub Release with Assets ==="
+# Step 5: Push Verified Tag and Publish Release via gh CLI
+echo "=== [Step 5/5] Pushing Tag ${TAG_NAME} and Publishing GitHub Release with Assets ==="
+if [[ "${FORCE_TAG}" -eq 1 && -n "${REMOTE_TAG}" ]]; then
+    git push origin "${TAG_NAME}" --force
+else
+    git push origin "${TAG_NAME}"
+fi
 ASSETS=(
     "${OUT_DIR}/02_OS.sha256"
     "${OUT_DIR}/02_OS-parts.sha256"

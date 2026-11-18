@@ -46,12 +46,8 @@ impl FtsSearcher {
             })
             .map_err(|e| AgentError::Database(format!("FTS query error: {}", e)))?;
 
-        let mut results = Vec::new();
-        for res in rows.flatten() {
-            results.push(res);
-        }
-
-        Ok(results)
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| AgentError::Database(format!("FTS row error: {}", e)))
     }
 }
 

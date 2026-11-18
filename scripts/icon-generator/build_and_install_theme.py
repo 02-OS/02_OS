@@ -81,46 +81,79 @@ MaxSize=512
 Type=Scalable
 """
 
-def wrap_svg(defs, body, width=512, height=512):
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="100%" height="100%">
-  <defs>
-    <!-- Ambient Drop Shadow -->
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+GLOBAL_SVG_DEFS = (
+    (
+        "shadow",
+        """    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
       <feDropShadow dx="0" dy="18" stdDeviation="20" flood-color="#000000" flood-opacity="0.45"/>
-    </filter>
-    <filter id="folder-shadow" x="-20%" y="-20%" width="140%" height="140%">
+    </filter>""",
+    ),
+    (
+        "folder-shadow",
+        """    <filter id="folder-shadow" x="-20%" y="-20%" width="140%" height="140%">
       <feDropShadow dx="0" dy="14" stdDeviation="16" flood-color="#000000" flood-opacity="0.40"/>
-    </filter>
-    <filter id="pocket-shadow" x="-15%" y="-15%" width="130%" height="130%">
+    </filter>""",
+    ),
+    (
+        "pocket-shadow",
+        """    <filter id="pocket-shadow" x="-15%" y="-15%" width="130%" height="130%">
       <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#000000" flood-opacity="0.32"/>
-    </filter>
-    <filter id="glyph-shadow" x="-25%" y="-25%" width="150%" height="150%">
+    </filter>""",
+    ),
+    (
+        "glyph-shadow",
+        """    <filter id="glyph-shadow" x="-25%" y="-25%" width="150%" height="150%">
       <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#000000" flood-opacity="0.36"/>
-    </filter>
-    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+    </filter>""",
+    ),
+    (
+        "glow",
+        """    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
       <feGaussianBlur stdDeviation="12" result="blur"/>
       <feComposite in="SourceGraphic" in2="blur" operator="over"/>
-    </filter>
-
-    <!-- Glass Specular Rim Highlight -->
-    <linearGradient id="specular-rim" x1="0" y1="0" x2="0" y2="1">
+    </filter>""",
+    ),
+    (
+        "specular-rim",
+        """    <linearGradient id="specular-rim" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#ffffff" stop-opacity="0.50"/>
       <stop offset="25%" stop-color="#ffffff" stop-opacity="0.18"/>
       <stop offset="70%" stop-color="#ffffff" stop-opacity="0.04"/>
       <stop offset="100%" stop-color="#ffffff" stop-opacity="0.12"/>
-    </linearGradient>
-
-    <!-- Top Gloss Sheen Overlay -->
-    <linearGradient id="top-gloss" x1="0" y1="0" x2="0" y2="1">
+    </linearGradient>""",
+    ),
+    (
+        "top-gloss",
+        """    <linearGradient id="top-gloss" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#ffffff" stop-opacity="0.32"/>
       <stop offset="40%" stop-color="#ffffff" stop-opacity="0.06"/>
       <stop offset="100%" stop-color="#ffffff" stop-opacity="0.0"/>
-    </linearGradient>
-    {defs}
-  </defs>
-  {body}
-</svg>"""
+    </linearGradient>""",
+    ),
+)
+
+
+def wrap_svg(defs, body, width=512, height=512):
+    combined_ref_text = f"{defs or ''}\n{body or ''}"
+    used_defs = [
+        snippet
+        for def_id, snippet in GLOBAL_SVG_DEFS
+        if f"#{def_id}" in combined_ref_text and f'id="{def_id}"' not in (defs or "")
+    ]
+    custom_defs = (defs or "").strip()
+    if custom_defs:
+        used_defs.append(f"    {custom_defs}")
+    defs_block = ""
+    if used_defs:
+        joined = "\n".join(used_defs)
+        defs_block = f"  <defs>\n{joined}\n  </defs>\n"
+    return (
+        f'<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="100%" height="100%">\n'
+        f"{defs_block}"
+        f"  {body}\n"
+        f"</svg>"
+    )
 
 def squircle_card(bg_id, inner_art):
     return f"""

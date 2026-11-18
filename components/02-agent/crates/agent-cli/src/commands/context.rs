@@ -1,5 +1,5 @@
 use agent_context::ContextCompiler;
-use agent_core::Result;
+use agent_core::{truncate_chars, Result};
 use agent_git::GitDiscovery;
 use std::env;
 
@@ -71,11 +71,7 @@ pub fn execute(task: &str, budget: usize, json_output: bool) -> Result<()> {
             for m in &package.verified_memories {
                 println!("  {}", m.claim);
                 for ev in &m.evidence {
-                    let commit_short = if ev.commit.len() >= 7 {
-                        &ev.commit[..7]
-                    } else {
-                        &ev.commit
-                    };
+                    let commit_short = truncate_chars(&ev.commit, 7);
                     println!("  source: {} (commit {})", ev.file, commit_short);
                 }
             }
@@ -102,11 +98,7 @@ pub fn execute(task: &str, budget: usize, json_output: bool) -> Result<()> {
         if !package.git_context.recent_commits.is_empty() {
             println!("  recent commits touching context:");
             for c in package.git_context.recent_commits.iter().take(3) {
-                let short_id = if c.commit_id.len() >= 7 {
-                    &c.commit_id[..7]
-                } else {
-                    &c.commit_id
-                };
+                let short_id = truncate_chars(&c.commit_id, 7);
                 println!("    {} {}", short_id, c.summary);
             }
         }

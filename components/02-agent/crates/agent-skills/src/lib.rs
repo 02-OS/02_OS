@@ -7,6 +7,6 @@ mod identity;
 mod load;
 mod tools;
 
-pub use identity::{constant_time_eq, AgentId, CapabilityToken, SharedContextScope};
-pub use load::{load_skill, Skill, SkillError};
+pub use identity::{constant_time_eq, AgentId, CapabilityToken, SessionPolicy, SharedContextScope};
+pub use load::{discover_skills, load_skill, Skill, SkillError};
 pub use tools::known_tools;

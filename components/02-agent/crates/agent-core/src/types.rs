@@ -1,8 +1,17 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::fmt;
 use std::path::{Path, PathBuf};
+
+/// Truncate `text` to at most `max_chars` Unicode scalar values on a valid UTF-8 boundary.
+pub fn truncate_chars(text: &str, max_chars: usize) -> &str {
+    match text.char_indices().nth(max_chars) {
+        Some((idx, _)) => &text[..idx],
+        None => text,
+    }
+}
 
 /// Deterministic unique identifier for a repository on the local system.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -478,29 +487,34 @@ impl SecretPattern {
 
         // Substring matches for credential filenames. Source files such as
         // `secret_rotation.go` stay in the catalog; their bodies are redacted.
-        if !is_source_file_name(&file_name)
+        !is_source_file_name(&file_name)
             && !file_name.ends_with(".md")
             && !file_name.ends_with(".txt")
             && (file_name.contains("secret")
                 || file_name.contains("credential")
                 || file_name.contains("private_key"))
-        {
-            return true;
-        }
+    }
 
-        false
+    /// Replace documented credential patterns with `[REDACTED]` without allocating on clean input.
+    pub fn redact_cow(content: &str) -> Cow<'_, str> {
+        let patterns = compiled_secret_patterns();
+        let matches = patterns.set.matches(content);
+        if !matches.matched_any() {
+            return Cow::Borrowed(content);
+        }
+        let mut redacted = Cow::Borrowed(content);
+        for index in matches.iter() {
+            let (pattern, replacement) = &patterns.rules[index];
+            if let Cow::Owned(replaced) = pattern.replace_all(&redacted, *replacement) {
+                redacted = Cow::Owned(replaced);
+            }
+        }
+        redacted
     }
 
     /// Replace documented credential patterns with `[REDACTED]`.
     pub fn redact(content: &str) -> String {
-        let mut redacted = content.to_string();
-        for pattern in secret_patterns() {
-            let next = pattern.replace_all(&redacted, "[REDACTED]");
-            if next != redacted {
-                redacted = next.into_owned();
-            }
-        }
-        redacted
+        Self::redact_cow(content).into_owned()
     }
 }
 
@@ -514,23 +528,51 @@ fn is_source_file_name(file_name: &str) -> bool {
         .any(|ext| file_name.ends_with(&format!(".{ext}")))
 }
 
-fn secret_patterns() -> &'static [regex::Regex] {
+struct SecretPatterns {
+    set: regex::RegexSet,
+    rules: Vec<(regex::Regex, &'static str)>,
+}
+
+fn compiled_secret_patterns() -> &'static SecretPatterns {
     use std::sync::OnceLock;
-    static PATTERNS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
+    static PATTERNS: OnceLock<SecretPatterns> = OnceLock::new();
     PATTERNS.get_or_init(|| {
-        [
-            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
-            r"\bAKIA[0-9A-Z]{16}\b",
+        let specs: [(&str, &str); 9] = [
+            (
+                r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+                "[REDACTED]",
+            ),
+            (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", "[REDACTED]"),
             // Named AWS secret access keys only. A bare 40-character hex blob stays visible.
-            r#"(?i)aws_secret_access_key\s*[=:]\s*["']?[A-Za-z0-9/+=]{40}"#,
-            r"\bghp_[A-Za-z0-9_]{36}\b",
-            r"\bgithub_pat_[A-Za-z0-9_]{82}\b",
-            r"\bxox[baprs]-[0-9A-Za-z-]{10,48}",
-            r#"(?i)(api[_-]?key|secret|token)\s*[:=]\s*["'][A-Za-z0-9_\-]{20,}["']"#,
-        ]
-        .into_iter()
-        .map(|pattern| regex::Regex::new(pattern).expect("secret pattern"))
-        .collect()
+            (
+                r#"(?i)aws_secret_access_key\s*[=:]\s*["']?[A-Za-z0-9/+=]{40}"#,
+                "[REDACTED]",
+            ),
+            (r"\bgh[pousr]_[A-Za-z0-9_]{36,255}\b", "[REDACTED]"),
+            (r"\bgithub_pat_[A-Za-z0-9_]{22,255}\b", "[REDACTED]"),
+            (r"\bxox[baprs]-[0-9A-Za-z-]{10,48}", "[REDACTED]"),
+            (
+                r"(?i)(Authorization\s*:\s*(?:Bearer|Basic)\s+)[A-Za-z0-9._~+/=-]{8,}",
+                "${1}[REDACTED]",
+            ),
+            (
+                r#"([a-zA-Z][a-zA-Z0-9+.-]*://)[^\s/:@"'<>]+:[^\s/@"'<>]+@"#,
+                "${1}[REDACTED]@",
+            ),
+            (
+                r#"(?i)["']?(?:api[_-]?key|secret|token|password|passwd|auth)["']?\s*[:=]\s*["'][A-Za-z0-9_.+/=-]{12,}["']"#,
+                "[REDACTED]",
+            ),
+        ];
+        let set = regex::RegexSet::new(specs.iter().map(|(pattern, _)| *pattern))
+            .expect("secret pattern set");
+        let rules = specs
+            .into_iter()
+            .map(|(pattern, replacement)| {
+                (regex::Regex::new(pattern).expect("secret pattern"), replacement)
+            })
+            .collect();
+        SecretPatterns { set, rules }
     })
 }
 

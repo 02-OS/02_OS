@@ -1,6 +1,9 @@
 use agent_core::{
-    HostKind, Language, LiveEnvironmentInfo, RepoConfig, RepoId, SecretPattern, StoragePaths,
+    contain::{random_hex, write_private_atomic},
+    truncate_chars, HostKind, Language, LiveEnvironmentInfo, RepoConfig, RepoId, SecretPattern,
+    StoragePaths,
 };
+use std::borrow::Cow;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tempfile::tempdir;
@@ -145,4 +148,56 @@ fn test_config_refuses_symlink_and_does_not_follow_it() {
         std::fs::read_to_string(&external).unwrap(),
         "max_file_size_kb = 1\n"
     );
+}
+
+#[test]
+fn test_secret_redaction_extended_patterns_and_cow() {
+    assert!(matches!(
+        SecretPattern::redact_cow("pub fn clean_helper() -> i32 { 42 }"),
+        Cow::Borrowed(_)
+    ));
+
+    let samples = [
+        "aws_key=ASIATEST1234567890AB".to_string(),
+        format!("gho_{}", "b".repeat(36)),
+        format!("ghu_{}", "c".repeat(36)),
+        format!("ghs_{}", "d".repeat(36)),
+        format!("ghr_{}", "e".repeat(36)),
+        format!("github_pat_{}", "f".repeat(45)),
+        "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abc.def".to_string(),
+        "Authorization: Basic dXNlcjpwYXNzd29yZDEyMw==".to_string(),
+        "https://alice:hunter2secret@git.example.com/org/repo.git".to_string(),
+        r#"{"password": "base64+Secret/Value=="}"#.to_string(),
+        r#"passwd = "jwt.part1.part2.part3""#.to_string(),
+        r#"auth: "super+secret/token=1234""#.to_string(),
+    ];
+
+    for sample in samples {
+        let out = SecretPattern::redact(&sample);
+        assert!(out.contains("[REDACTED]"), "failed to redact: {sample}");
+    }
+    assert!(
+        !SecretPattern::redact("https://alice:hunter2secret@git.example.com/repo")
+            .contains("hunter2secret")
+    );
+    assert_eq!(
+        SecretPattern::redact("https://example.com:8443/path"),
+        "https://example.com:8443/path"
+    );
+}
+
+#[test]
+fn test_truncate_chars_and_write_private_atomic() {
+    let text = "aébç🚀d";
+    assert_eq!(truncate_chars(text, 3), "aéb");
+    assert_eq!(truncate_chars(text, 5), "aébç🚀");
+    assert_eq!(truncate_chars(text, 100), text);
+
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("nested").join("state.json");
+    write_private_atomic(&target, br#"{"ok":true}"#).unwrap();
+    let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert_eq!(std::fs::read(&target).unwrap(), br#"{"ok":true}"#);
+    assert_eq!(random_hex(16).unwrap().len(), 32);
 }

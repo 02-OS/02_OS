@@ -1,17 +1,20 @@
 use crate::protocol::{ToolCallResult, ToolDefinition};
-use agent_context::ContextCompiler;
+use agent_context::{estimate_tokens, types::EvidencePackage, ContextCompiler, ScoredFact};
 use agent_core::{
     config::RepoConfig,
     contain::validate_evidence_file,
     paths::StoragePaths,
-    types::{EvidenceMemory, MemoryKind, MemoryStatus, SecretPattern},
+    types::{EvidenceMemory, MemoryKind, MemoryStatus, RepoId, SecretPattern},
+    AgentError, Result,
 };
-use agent_git::GitRepo;
+use agent_git::{discover_workspace, GitRepo};
 use agent_index::IndexDatabase;
-use agent_memory::{MemoryStore, MemoryVerifier};
+use agent_memory::{FactStore, MemoryStore, MemoryVerifier, StalenessEngine};
+use agent_skills::{SessionPolicy, SharedContextScope};
 use chrono::Utc;
 use serde_json::{json, Value};
-use std::path::Path;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 
 pub fn list_tools() -> Vec<ToolDefinition> {
     let mut tools = vec![
@@ -196,6 +199,30 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "additionalProperties": false
             }),
         },
+        ToolDefinition {
+            name: "memory_list".to_string(),
+            description: "List repository evidence memories with optional status filter and pagination cursor.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string", "description": "Optional status filter: fresh, degraded, stale, invalidated" },
+                    "limit": { "type": "integer", "description": "Maximum results (default: 50, max: 200)" },
+                    "cursor": { "type": "string", "description": "Pagination offset cursor" }
+                },
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "memory_verify".to_string(),
+            description: "Re-evaluate evidence freshness and staleness against the repository working tree.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Optional memory ID to inspect" }
+                },
+                "additionalProperties": false
+            }),
+        },
     ];
     tools.extend(crate::nav_tools::definitions());
 
@@ -218,23 +245,181 @@ pub fn list_tools() -> Vec<ToolDefinition> {
     tools
 }
 
+pub(crate) fn scoped_memory_store(
+    repo_id: &RepoId,
+    policy: Option<&SessionPolicy>,
+) -> Result<MemoryStore> {
+    let Some(policy) = policy else {
+        return MemoryStore::for_repo(repo_id);
+    };
+    if !policy.allows_repository(repo_id.as_str()) {
+        return Err(AgentError::Security(
+            "context access denied for scope".into(),
+        ));
+    }
+    let dir = StoragePaths::repo_dir(repo_id)?;
+    match &policy.scope {
+        SharedContextScope::Private => Ok(MemoryStore::new(dir.join(format!(
+            "memories.private.{}.jsonl",
+            policy.agent_id.as_str()
+        )))),
+        SharedContextScope::Session(id) => Ok(MemoryStore::new(
+            dir.join(format!("memories.session.{id}.jsonl")),
+        )),
+        SharedContextScope::Repository(_) => MemoryStore::for_repo(repo_id),
+    }
+}
+
+pub(crate) fn scoped_fact_store(
+    repo_id: &RepoId,
+    policy: Option<&SessionPolicy>,
+) -> Result<FactStore> {
+    let Some(policy) = policy else {
+        return FactStore::for_repo(repo_id);
+    };
+    if !policy.allows_repository(repo_id.as_str()) {
+        return Err(AgentError::Security(
+            "context access denied for scope".into(),
+        ));
+    }
+    let dir = StoragePaths::repo_dir(repo_id)?;
+    match &policy.scope {
+        SharedContextScope::Private => {
+            FactStore::open(dir.join(format!("facts.private.{}.sqlite", policy.agent_id.as_str())))
+        }
+        SharedContextScope::Session(id) => {
+            FactStore::open(dir.join(format!("facts.session.{id}.sqlite")))
+        }
+        SharedContextScope::Repository(_) => FactStore::for_repo(repo_id),
+    }
+}
+
+pub(crate) fn apply_policy_to_package(
+    repo_id: &RepoId,
+    policy: Option<&SessionPolicy>,
+    package: &mut EvidencePackage,
+) {
+    let Some(policy) = policy else {
+        return;
+    };
+    if matches!(policy.scope, SharedContextScope::Repository(_)) {
+        return;
+    }
+    // Private and session scopes isolate prior memories and facts away from shared stores.
+    let memories = scoped_memory_store(repo_id, Some(policy))
+        .and_then(|store| store.load_all())
+        .unwrap_or_default();
+    let mut verified = Vec::new();
+    let mut diagnostic = Vec::new();
+    for mem in memories {
+        if mem.status == MemoryStatus::Fresh && mem.confidence > 0.0 {
+            verified.push(mem);
+        } else {
+            diagnostic.push(mem);
+        }
+    }
+    package.verified_memories = verified;
+    package.diagnostic_memories = diagnostic;
+
+    let facts = scoped_fact_store(repo_id, Some(policy))
+        .and_then(|store| {
+            let now = Utc::now();
+            Ok(store
+                .list(repo_id.as_str())?
+                .into_iter()
+                .filter_map(|f| {
+                    let eff = store.effective_confidence(&f, now);
+                    (eff > 0.05).then_some(ScoredFact {
+                        id: f.id,
+                        claim: f.claim,
+                        relative_path: f.relative_path,
+                        symbol: f.symbol,
+                        effective_confidence: eff,
+                    })
+                })
+                .collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
+    package.relevant_facts = facts;
+}
+
+fn canonicalize_worktree(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+pub(crate) fn resolve_confined_repo(
+    default_root: &Path,
+    allowed_roots: &[PathBuf],
+    arguments: &Value,
+) -> std::result::Result<GitRepo, String> {
+    let base_git = GitRepo::open(default_root).map_err(|e| format!("Git error: {e}"))?;
+    let override_str = arguments
+        .get("repo_path")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(override_path) = override_str else {
+        return Ok(base_git);
+    };
+    let candidate = Path::new(override_path);
+    if !candidate.is_absolute() {
+        return Err("repo_path must be an absolute path".to_string());
+    }
+    let cand_git = GitRepo::open(candidate).map_err(|e| format!("Git error: {e}"))?;
+    let cand_canon = canonicalize_worktree(cand_git.root_path());
+
+    if cand_canon == canonicalize_worktree(base_git.root_path()) {
+        return Ok(cand_git);
+    }
+    for root in allowed_roots {
+        if let Ok(git) = GitRepo::open(root) {
+            if canonicalize_worktree(git.root_path()) == cand_canon {
+                return Ok(cand_git);
+            }
+        } else if canonicalize_worktree(root) == cand_canon {
+            return Ok(cand_git);
+        }
+    }
+    if let Ok(members) = discover_workspace(base_git.root_path()) {
+        for member in members {
+            if canonicalize_worktree(&member.root) == cand_canon {
+                return Ok(cand_git);
+            }
+        }
+    }
+    Err("repo_path is outside allowed workspace repositories".to_string())
+}
+
 pub fn call_tool(repo_root: &Path, name: &str, arguments: &Value) -> ToolCallResult {
+    call_tool_with_policy(
+        repo_root,
+        std::slice::from_ref(&repo_root.to_path_buf()),
+        None,
+        name,
+        arguments,
+    )
+}
+
+pub fn call_tool_with_policy(
+    repo_root: &Path,
+    allowed_roots: &[PathBuf],
+    policy: Option<&SessionPolicy>,
+    name: &str,
+    arguments: &Value,
+) -> ToolCallResult {
     if matches!(name, "approve" | "approval" | "record_approval") {
         return ToolCallResult::error("mcp client cannot approve its own call".to_string());
     }
-    let override_root = arguments
-        .get("repo_path")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from);
-    let repo_root = override_root.as_deref().unwrap_or(repo_root);
+    if let Some(policy) = policy {
+        if let Err(err) = policy.allows_tool(name) {
+            return ToolCallResult::error(err.to_string());
+        }
+    }
 
-    let git_repo = match GitRepo::open(repo_root) {
+    let git_repo = match resolve_confined_repo(repo_root, allowed_roots, arguments) {
         Ok(r) => r,
-        Err(e) => return ToolCallResult::error(format!("Git error: {}", e)),
+        Err(msg) => return ToolCallResult::error(msg),
     };
-    // Every consumer must use the discovered worktree root, including overrides
-    // that name a nested directory. Catalog paths are repository-relative.
     let repo_root = git_repo.root_path();
 
     let repo_info = match git_repo.info() {
@@ -242,6 +427,11 @@ pub fn call_tool(repo_root: &Path, name: &str, arguments: &Value) -> ToolCallRes
         Err(e) => return ToolCallResult::error(format!("Repo info error: {}", e)),
     };
     let repo_id = &repo_info.id;
+    if let Some(policy) = policy {
+        if !policy.allows_repository(repo_id.as_str()) {
+            return ToolCallResult::error("context access denied for repository scope".to_string());
+        }
+    }
 
     let db_path = match StoragePaths::repo_db_path(repo_id) {
         Ok(p) => p,
@@ -253,11 +443,59 @@ pub fn call_tool(repo_root: &Path, name: &str, arguments: &Value) -> ToolCallRes
         Err(e) => return ToolCallResult::error(format!("Database error: {}", e)),
     };
 
+    let result = dispatch_tool(
+        name, repo_root, &git_repo, &db, repo_id, &repo_info, arguments, policy,
+    );
+
+    // Record tool invocation and estimated returned tokens in SQLite v5 telemetry (#153).
+    if db.note_repo_presence(&repo_info).is_ok() {
+        let canonical = serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string());
+        let mut hasher = Sha256::new();
+        hasher.update(canonical.as_bytes());
+        let args_hash = hex::encode(hasher.finalize());
+        let tokens: u64 = result
+            .content
+            .iter()
+            .map(|c| estimate_tokens(&c.text) as u64)
+            .sum();
+        let actor_kind = if policy.is_some() {
+            "agt"
+        } else {
+            "mcp-client"
+        };
+        let actor_name = policy.map(|p| p.agent_id.as_str()).unwrap_or("default");
+        let _ = db.record_completed_invocation(
+            repo_id,
+            actor_kind,
+            actor_name,
+            name,
+            &args_hash,
+            &canonical,
+            result.is_error,
+            result.is_error.then_some("tool_error"),
+            Some(tokens),
+        );
+    }
+
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_tool(
+    name: &str,
+    repo_root: &Path,
+    git_repo: &GitRepo,
+    db: &IndexDatabase,
+    repo_id: &RepoId,
+    repo_info: &agent_core::RepoInfo,
+    arguments: &Value,
+    policy: Option<&SessionPolicy>,
+) -> ToolCallResult {
     if matches!(name, "add" | "cognify" | "graph_export") {
         return crate::graph_tools::call(repo_root, name, arguments);
     }
-    if let Some(result) = crate::nav_tools::call(
-        name, repo_root, &git_repo, &db, repo_id, &repo_info, arguments,
+    if let Some(result) = crate::nav_tools::call_with_policy(
+        name, repo_root, git_repo, db, repo_id, repo_info, arguments, policy,
     ) {
         return result;
     }
@@ -367,17 +605,23 @@ pub fn call_tool(repo_root: &Path, name: &str, arguments: &Value) -> ToolCallRes
 
         "repository_context" => {
             let task = arguments["task"].as_str().unwrap_or("");
-            let budget = arguments["token_budget"].as_u64().unwrap_or(8000) as usize;
+            let budget = arguments["token_budget"]
+                .as_u64()
+                .unwrap_or(8000)
+                .min(100_000) as usize;
 
             match ContextCompiler::compile(repo_root, task, budget) {
-                Ok(package) => ToolCallResult::text(package.serialized_payload()),
+                Ok(mut package) => {
+                    apply_policy_to_package(repo_id, policy, &mut package);
+                    ToolCallResult::text(package.serialized_payload())
+                }
                 Err(e) => ToolCallResult::error(format!("Context compiler error: {}", e)),
             }
         }
 
         "memory_get" => {
             let id = arguments["id"].as_str().unwrap_or("");
-            let store = match MemoryStore::for_repo(repo_id) {
+            let store = match scoped_memory_store(repo_id, policy) {
                 Ok(s) => s,
                 Err(e) => return ToolCallResult::error(format!("Store error: {}", e)),
             };
@@ -402,7 +646,7 @@ pub fn call_tool(repo_root: &Path, name: &str, arguments: &Value) -> ToolCallRes
                 })
                 .unwrap_or_default();
 
-            let store = match MemoryStore::for_repo(repo_id) {
+            let store = match scoped_memory_store(repo_id, policy) {
                 Ok(s) => s,
                 Err(e) => return ToolCallResult::error(format!("Store error: {}", e)),
             };
@@ -412,7 +656,10 @@ pub fn call_tool(repo_root: &Path, name: &str, arguments: &Value) -> ToolCallRes
                 return ToolCallResult::error(format!("evidence path rejected: {err}"));
             }
 
-            let commit_id = repo_info.head_commit.unwrap_or_else(|| "none".to_string());
+            let commit_id = repo_info
+                .head_commit
+                .clone()
+                .unwrap_or_else(|| "none".to_string());
             let evidence =
                 match MemoryVerifier::capture_evidence(repo_root, file, symbols, &commit_id) {
                     Ok(evidence) => evidence,
@@ -439,12 +686,15 @@ pub fn call_tool(repo_root: &Path, name: &str, arguments: &Value) -> ToolCallRes
         }
 
         "memory_status" => {
-            let store = match MemoryStore::for_repo(repo_id) {
+            let store = match scoped_memory_store(repo_id, policy) {
                 Ok(s) => s,
                 Err(e) => return ToolCallResult::error(format!("Store error: {}", e)),
             };
 
-            let memories = store.load_all().unwrap_or_default();
+            let memories = match store.load_all() {
+                Ok(list) => list,
+                Err(e) => return ToolCallResult::error(format!("Load memories error: {}", e)),
+            };
             let fresh = memories
                 .iter()
                 .filter(|m| m.status == MemoryStatus::Fresh)
@@ -468,6 +718,86 @@ pub fn call_tool(repo_root: &Path, name: &str, arguments: &Value) -> ToolCallRes
                 "memories": memories,
             });
             ToolCallResult::text(res.to_string())
+        }
+
+        "memory_list" => {
+            let store = match scoped_memory_store(repo_id, policy) {
+                Ok(s) => s,
+                Err(e) => return ToolCallResult::error(format!("Store error: {}", e)),
+            };
+            let memories = match store.load_all() {
+                Ok(list) => list,
+                Err(e) => return ToolCallResult::error(format!("Load memories error: {}", e)),
+            };
+            let status_filter = arguments
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_ascii_lowercase());
+            let filtered: Vec<EvidenceMemory> = memories
+                .into_iter()
+                .filter(|m| match status_filter.as_deref() {
+                    Some(wanted) if !wanted.is_empty() => m.status.to_string() == wanted,
+                    _ => true,
+                })
+                .collect();
+            let offset = arguments
+                .get("cursor")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let limit = arguments
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(50)
+                .clamp(1, 200) as usize;
+            let end = offset.saturating_add(limit).min(filtered.len());
+            let truncated = end < filtered.len();
+            let next_cursor = truncated.then(|| end.to_string());
+            let page = if offset < filtered.len() {
+                filtered[offset..end].to_vec()
+            } else {
+                Vec::new()
+            };
+            ToolCallResult::text(
+                json!({
+                    "memories": page,
+                    "truncated": truncated,
+                    "next_cursor": next_cursor
+                })
+                .to_string(),
+            )
+        }
+
+        "memory_verify" => {
+            let store = match scoped_memory_store(repo_id, policy) {
+                Ok(s) => s,
+                Err(e) => return ToolCallResult::error(format!("Store error: {}", e)),
+            };
+            let report = match StalenessEngine::evaluate(repo_root, repo_id, git_repo, db, &store) {
+                Ok(report) => report,
+                Err(e) => return ToolCallResult::error(format!("Verify failed: {}", e)),
+            };
+            let target_id = arguments
+                .get("id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            if let Some(id) = target_id {
+                match store.get(id) {
+                    Ok(Some(mem)) => ToolCallResult::text(
+                        json!({
+                            "memory": mem,
+                            "fresh": report.fresh_count,
+                            "degraded": report.degraded_count,
+                            "stale": report.stale_count,
+                        })
+                        .to_string(),
+                    ),
+                    Ok(None) => ToolCallResult::error(format!("Memory '{}' not found", id)),
+                    Err(e) => ToolCallResult::error(format!("Verify lookup error: {}", e)),
+                }
+            } else {
+                ToolCallResult::text(json!(report).to_string())
+            }
         }
 
         unknown => ToolCallResult::error(format!("Unknown tool: '{}'", unknown)),

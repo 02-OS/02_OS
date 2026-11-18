@@ -1,6 +1,4 @@
-use crate::{paths::StoragePaths, AgentError, Result};
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use crate::{contain::write_private_atomic, paths::StoragePaths, AgentError, Result};
 use std::path::Path;
 
 /// Phases a Shell session is allowed to show.
@@ -16,18 +14,7 @@ pub fn phase_label(raw: &str) -> &'static str {
 /// Write one allowlisted phase line. The Shell extension reads this file.
 pub fn write_index_phase(path: &Path, phase: &str) -> Result<()> {
     let phase = phase_label(phase);
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            StoragePaths::ensure_private_dir(parent)?;
-        }
-    }
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, format!("{phase}\n"))?;
-    let mut permissions = fs::metadata(&temporary)?.permissions();
-    permissions.set_mode(0o600);
-    fs::set_permissions(&temporary, permissions)?;
-    fs::rename(&temporary, path)?;
-    Ok(())
+    write_private_atomic(path, format!("{phase}\n").as_bytes())
 }
 
 /// Publish the phase for the user session at `~/.local/share/02-agent/index-phase`.
@@ -51,6 +38,7 @@ pub fn require_phase(phase: &str) -> Result<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]

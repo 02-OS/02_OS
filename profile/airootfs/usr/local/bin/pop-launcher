@@ -3,8 +3,15 @@
 
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
+
+
+def current_desktops():
+    raw = os.environ.get("XDG_CURRENT_DESKTOP", "GNOME")
+    parts = [item.strip() for item in raw.split(":") if item.strip()]
+    return set(parts) if parts else {"GNOME"}
 
 
 def application_dirs():
@@ -39,12 +46,17 @@ def application_dirs():
     return dirs
 
 
+def _split_semicolon_list(value):
+    return [part.strip() for part in (value or "").split(";") if part.strip()]
+
+
 def parse_desktop(path):
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    name = exec_line = icon = comment = None
+    name = generic_name = exec_line = try_exec = icon = comment = keywords = None
+    only_show_in = not_show_in = None
     entry_type = None
     hidden = False
     no_display = False
@@ -65,12 +77,22 @@ def parse_desktop(path):
             entry_type = value
         elif key == "Name" and name is None:
             name = value
+        elif key == "GenericName" and generic_name is None:
+            generic_name = value
+        elif key == "Keywords" and keywords is None:
+            keywords = value
         elif key == "Exec" and exec_line is None:
             exec_line = value
+        elif key == "TryExec" and try_exec is None:
+            try_exec = value
         elif key == "Icon" and icon is None:
             icon = value
         elif key == "Comment" and comment is None:
             comment = value
+        elif key == "OnlyShowIn" and only_show_in is None:
+            only_show_in = value
+        elif key == "NotShowIn" and not_show_in is None:
+            not_show_in = value
         elif key == "Hidden":
             hidden = value.lower() == "true"
         elif key == "NoDisplay":
@@ -79,16 +101,52 @@ def parse_desktop(path):
         return None
     if entry_type not in (None, "Application"):
         return None
+    desktops = current_desktops()
+    if only_show_in is not None:
+        allowed = set(_split_semicolon_list(only_show_in))
+        if allowed and desktops.isdisjoint(allowed):
+            return None
+    if not_show_in is not None:
+        excluded = set(_split_semicolon_list(not_show_in))
+        if not desktops.isdisjoint(excluded):
+            return None
+    if try_exec:
+        try_path = Path(try_exec)
+        if try_path.is_absolute():
+            if not (try_path.is_file() and os.access(try_path, os.X_OK)):
+                return None
+        elif shutil.which(try_exec) is None:
+            return None
+    kw_list = _split_semicolon_list(keywords)
+    search_parts = [
+        name,
+        generic_name or "",
+        " ".join(kw_list),
+        comment or "",
+        exec_line,
+    ]
     return {
         "path": str(path),
         "name": name,
+        "generic_name": generic_name or "",
+        "keywords": kw_list,
         "exec": exec_line,
         "icon": icon,
-        "description": comment if comment else exec_line,
+        "description": comment if comment else (generic_name if generic_name else exec_line),
+        "search_blob": " ".join(part for part in search_parts if part).casefold(),
     }
 
 
-def desktop_file_id(path):
+def desktop_file_id(path, base_dir=None):
+    if base_dir is not None:
+        try:
+            rel = path.relative_to(base_dir)
+            parts = list(rel.parts)
+            if parts and parts[0] == "applications" and len(parts) > 1:
+                parts = parts[1:]
+            return "-".join(parts)
+        except ValueError:
+            pass
     return path.name
 
 
@@ -99,13 +157,13 @@ def load_apps():
         if not directory.is_dir():
             continue
         try:
-            paths = sorted(directory.glob("*.desktop"))
+            paths = sorted(directory.rglob("*.desktop"))
         except OSError:
             continue
         for path in paths:
             if not path.is_file():
                 continue
-            file_id = desktop_file_id(path)
+            file_id = desktop_file_id(path, directory)
             if file_id in seen_ids:
                 continue
             # Record the id before parsing so Hidden=true overrides a later system entry.
@@ -116,6 +174,14 @@ def load_apps():
             apps.append(item)
     apps.sort(key=lambda app: (app["name"].casefold(), app["path"]))
     return apps
+
+
+def app_matches_query(app, query):
+    needle = query.casefold()
+    blob = app.get("search_blob")
+    if blob is not None:
+        return needle in blob
+    return needle in app.get("name", "").casefold()
 
 
 def emit(payload):
@@ -162,7 +228,7 @@ def main():
         if "Search" in message:
             query = str(message.get("Search") or "").casefold()
             if query:
-                matched = [app for app in apps if query in app["name"].casefold()]
+                matched = [app for app in apps if app_matches_query(app, query)]
             else:
                 matched = list(apps)
             current = matched

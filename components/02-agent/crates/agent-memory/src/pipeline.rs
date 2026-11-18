@@ -696,17 +696,6 @@ impl Task for WriteChunks {
                         symbol_fingerprint: None,
                     },
                 )?;
-                if ctx.ontology.allows_node("chunk") {
-                    ctx.db.upsert_node(
-                        ctx.info.id.as_str(),
-                        &ctx.dataset.id,
-                        &point_id,
-                        "chunk",
-                        &item.file.relative_path,
-                        Some(&point_id),
-                    )?;
-                    ctx.nodes_written += 1;
-                }
                 write_edge(ctx, &file_id, &point_id, EdgeKind::Owns)?;
                 ctx.chunks_written += 1;
             }
@@ -953,9 +942,10 @@ pub fn export_graph(
 fn load_scan(ctx: &mut TaskContext) -> Result<()> {
     let scanner = RepoScanner::new(ctx.root, ctx.config.clone());
     let mut scanned = scanner.scan();
+    let blobs = ctx.git.list_blob_ids().unwrap_or_default();
     for item in &mut scanned {
-        if let Ok(Some(blob)) = ctx.git.get_blob_id(&item.file.relative_path) {
-            item.file.git_blob_id = Some(blob);
+        if let Some(blob) = blobs.get(&item.file.relative_path) {
+            item.file.git_blob_id = Some(blob.clone());
         }
     }
     ctx.scanned = scanned;
@@ -987,12 +977,10 @@ fn extract_symbols(
 fn include_file(sources: &[SourceKind], file: &agent_core::IndexedFile) -> bool {
     let worktree = sources.contains(&SourceKind::Worktree);
     let docs = sources.contains(&SourceKind::Document);
-    match (worktree, docs) {
-        (false, false) => false,
-        (_, true) if is_document(file) => true,
-        (true, false) => true,
-        (true, true) => true,
-        (false, true) => false,
+    if is_document(file) {
+        docs
+    } else {
+        worktree
     }
 }
 
@@ -1072,23 +1060,28 @@ fn remember_point(
         }
         PutPoint::Inserted(inserted) => {
             ctx.datapoints_inserted += 1;
-            ctx.db.upsert_node(
-                ctx.info.id.as_str(),
-                &ctx.dataset.id,
-                &inserted.id,
-                kind,
-                &label,
-                Some(&inserted.id),
-            )?;
-            if let Some(previous) = inserted.previous_id {
+            if ctx.ontology.allows_node(kind) {
                 ctx.db.upsert_node(
                     ctx.info.id.as_str(),
                     &ctx.dataset.id,
-                    &previous,
+                    &inserted.id,
                     kind,
                     &label,
-                    Some(&previous),
+                    Some(&inserted.id),
                 )?;
+                ctx.nodes_written += 1;
+            }
+            if let Some(previous) = inserted.previous_id {
+                if ctx.ontology.allows_node(kind) {
+                    ctx.db.upsert_node(
+                        ctx.info.id.as_str(),
+                        &ctx.dataset.id,
+                        &previous,
+                        kind,
+                        &label,
+                        Some(&previous),
+                    )?;
+                }
                 write_edge(ctx, &inserted.id, &previous, EdgeKind::Supersedes)?;
             }
             Ok(inserted.id)

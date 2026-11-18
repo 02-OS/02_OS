@@ -292,3 +292,106 @@ fn rust_method_calls_use_the_method_identifier() {
     assert_eq!(methods.len(), 2);
     assert_ne!(methods[0].id, methods[1].id);
 }
+
+#[test]
+fn parser_extracts_docs_scopes_c_declarators_js_arrows_and_non_prefix_tests() {
+    let rust_code = r##"
+        /// Documented helper.
+        pub fn helper_not_a_test() {
+            let _s = "#[test] inside string";
+        }
+
+        #[test]
+        fn verify_token_rotation() {
+            helper_not_a_test();
+        }
+    "##;
+    let rs = CodeExtractor::extract("src/lib.rs", rust_code, Language::Rust).unwrap();
+    let helper = rs
+        .symbols
+        .iter()
+        .find(|s| s.name == "helper_not_a_test")
+        .unwrap();
+    assert_eq!(helper.doc_comment.as_deref(), Some("Documented helper."));
+    assert!(!rs.references.iter().any(|r| r.kind == ReferenceKind::Tests
+        && r.source_symbol_name.as_deref() == Some("helper_not_a_test")));
+    assert!(rs.references.iter().any(|r| {
+        r.kind == ReferenceKind::Tests
+            && r.source_symbol_name.as_deref() == Some("verify_token_rotation")
+            && r.target_name == "helper_not_a_test"
+    }));
+
+    let c_code = r#"
+        /* Return pointer helper */
+        int * alloc_buf(void) { return 0; }
+        int (*select_op(int x))(int) { obj->dispatch(); return 0; }
+    "#;
+    let c_res = CodeExtractor::extract("src/mem.c", c_code, Language::C).unwrap();
+    let alloc = c_res
+        .symbols
+        .iter()
+        .find(|s| s.name == "alloc_buf")
+        .unwrap();
+    assert_eq!(alloc.doc_comment.as_deref(), Some("Return pointer helper"));
+    assert!(c_res.symbols.iter().any(|s| s.name == "select_op"));
+    assert!(c_res
+        .references
+        .iter()
+        .any(|r| r.kind == ReferenceKind::Calls && r.target_name == "dispatch"));
+
+    let js_code = r#"
+        class Worker {
+            /** Run job */
+            run() {}
+        }
+        /** Build task */
+        export const buildTask = async () => { run(); };
+    "#;
+    let js_res = CodeExtractor::extract("app.js", js_code, Language::JavaScript).unwrap();
+    let run_sym = js_res.symbols.iter().find(|s| s.name == "run").unwrap();
+    assert_eq!(run_sym.kind, SymbolKind::Method);
+    assert_eq!(run_sym.qualified_name, "app.js::Worker::run");
+    assert_eq!(run_sym.doc_comment.as_deref(), Some("Run job"));
+    let arrow = js_res
+        .symbols
+        .iter()
+        .find(|s| s.name == "buildTask")
+        .unwrap();
+    assert_eq!(arrow.kind, SymbolKind::Function);
+    assert_eq!(arrow.doc_comment.as_deref(), Some("Build task"));
+
+    let py_code = "def greet():\n    \"\"\"Say hello\"\"\"\n    return 1\n";
+    let py_res = CodeExtractor::extract("greet.py", py_code, Language::Python).unwrap();
+    assert_eq!(
+        py_res
+            .symbols
+            .iter()
+            .find(|s| s.name == "greet")
+            .unwrap()
+            .doc_comment
+            .as_deref(),
+        Some("Say hello")
+    );
+
+    let tsx_res = CodeExtractor::extract(
+        "Comp.TSX",
+        "export const Badge = () => <span>ok</span>;\n",
+        Language::TypeScript,
+    )
+    .unwrap();
+    assert!(tsx_res.symbols.iter().any(|s| s.name == "Badge"));
+
+    let dart_code = r#"
+        void suite() {
+            group('a', () { test('works', () {}); });
+            group('b', () { test('works', () {}); });
+        }
+    "#;
+    let dart_res = CodeExtractor::extract("test.dart", dart_code, Language::Dart).unwrap();
+    let works_count = dart_res
+        .symbols
+        .iter()
+        .filter(|s| s.name == "works")
+        .count();
+    assert_eq!(works_count, 2);
+}

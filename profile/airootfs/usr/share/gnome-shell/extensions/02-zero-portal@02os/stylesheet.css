@@ -44,7 +44,7 @@
 .login-dialog-user-list-view .login-dialog-user-list .login-dialog-user-list-item:focus:hover {
     color: #f7f7f5;
     background-color: #000000;
-    box-shadow: none !important;
+    box-shadow: inset 0 0 0 2px rgba(0, 186, 243, 0.85) !important;
 }
 
 .login-dialog-user-list-view .login-dialog-user-list .login-dialog-user-list-item:active,
@@ -108,7 +108,7 @@
 .login-dialog .login-dialog-prompt-entry:focus {
     background-color: #000000;
     color: #f7f7f5;
-    box-shadow: none !important;
+    box-shadow: inset 0 0 0 2px rgba(0, 186, 243, 0.85) !important;
 }
 
 .login-dialog .login-dialog-button.cancel-button,

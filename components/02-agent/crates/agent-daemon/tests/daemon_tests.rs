@@ -112,11 +112,21 @@ fn test_resolve_mcp_repo_path() {
     let path = resolve_mcp_repo_path(&call, &mut session, &[], default_dir);
     assert_eq!(path, PathBuf::from("/tmp/my repo"));
 
+    let file_call = json!({
+        "method": "tools/call",
+        "params": {
+            "name": "file_outline",
+            "arguments": { "path": "src/lib.rs" }
+        }
+    });
+    let path = resolve_mcp_repo_path(&file_call, &mut session, &[], default_dir);
+    assert_eq!(path, PathBuf::from("/tmp/my repo"));
+
     let explicit = json!({
         "method": "tools/call",
         "params": {
             "name": "repository_status",
-            "arguments": { "path": "/work/proj" }
+            "arguments": { "repo_path": "/work/proj" }
         }
     });
     let path = resolve_mcp_repo_path(&explicit, &mut session, &[], default_dir);
