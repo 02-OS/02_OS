@@ -448,6 +448,7 @@ pub fn call_tool_with_policy(
     );
 
     // Record tool invocation and estimated returned tokens in SQLite v5 telemetry (#153).
+    // Persist only the canonical arguments digest, never raw tool arguments.
     if db.note_repo_presence(&repo_info).is_ok() {
         let canonical = serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string());
         let mut hasher = Sha256::new();
@@ -470,7 +471,7 @@ pub fn call_tool_with_policy(
             actor_name,
             name,
             &args_hash,
-            &canonical,
+            "",
             result.is_error,
             result.is_error.then_some("tool_error"),
             Some(tokens),

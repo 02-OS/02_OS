@@ -192,6 +192,7 @@ class OSProfileTests(unittest.TestCase):
                 uid, gid, mode = encoded.split(":")
                 self.assertEqual((uid, gid), ("0", "0"))
                 self.assertEqual(int(mode, 8) & 0o022, 0, f"Group/other writable privileged overlay file: {relative}")
+        self.assertEqual(permissions["/etc/sudoers.d"], "0:0:750")
         self.assertEqual(permissions["/etc/sudoers.d/01-live"], "0:0:440")
         for binary in optional_runtime:
             self.assertEqual(permissions[binary], "0:0:755")

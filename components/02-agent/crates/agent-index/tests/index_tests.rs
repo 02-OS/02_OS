@@ -415,3 +415,217 @@ fn pending_confirmation_nonce_and_v5_telemetry_work() {
         .iter()
         .any(|t| t.tool == "repository_context" && t.total_tokens == 512));
 }
+
+#[test]
+fn pending_approval_binds_to_exact_intended_arguments_without_storing_raw_args() {
+    use sha2::{Digest, Sha256};
+
+    let sha = |text: &str| {
+        let mut hasher = Sha256::new();
+        hasher.update(text.as_bytes());
+        hex::encode(hasher.finalize())
+    };
+
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("index.sqlite");
+    let mut db = IndexDatabase::open(&db_path).unwrap();
+    let repo_id = RepoId::new("approval-binding");
+    db.update_repo_info(&RepoInfo {
+        id: repo_id.clone(),
+        name: "approval-binding".into(),
+        root_path: dir.path().to_path_buf(),
+        head_commit: None,
+        branch: None,
+        is_clean: true,
+        modified_count: 0,
+        untracked_count: 0,
+    })
+    .unwrap();
+
+    let secret_a = format!("ghp_{}", "a".repeat(36));
+    let secret_b = format!("ghp_{}", "b".repeat(36));
+    let payload_a = format!(r#"{{"cmd":"deploy-prod","token":"{secret_a}"}}"#);
+    let payload_b = format!(r#"{{"cmd":"deploy-prod","token":"{secret_b}"}}"#);
+    let payload_redacted = r#"{"cmd":"deploy-prod","token":"[REDACTED]"}"#;
+
+    let hash_a = sha(&payload_a);
+    let hash_b = sha(&payload_b);
+    let hash_redacted = sha(payload_redacted);
+    assert_ne!(hash_a, hash_b);
+    assert_ne!(hash_a, hash_redacted);
+
+    // Malformed args_hash is rejected at pending registration time.
+    assert!(db
+        .start_pending_invocation(
+            &repo_id,
+            "agt",
+            "agt-worker",
+            "deploy",
+            "not-a-sha256",
+            &payload_a,
+            "nonce-bad",
+            "pending-bad",
+        )
+        .is_err());
+
+    db.start_pending_invocation(
+        &repo_id,
+        "agt",
+        "agt-worker",
+        "deploy",
+        &hash_a,
+        &payload_a,
+        "nonce-exact-1",
+        "pending-exact-1",
+    )
+    .unwrap();
+
+    // Pending confirmation carries the exact intended args_hash and no raw arguments.
+    let pending = db.list_pending_confirmations(&repo_id).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].args_hash, hash_a);
+    assert!(pending[0].args_canonical.is_empty());
+
+    // Mutated arguments (even differing only in a secret) and redacted-args hash must fail.
+    assert!(db
+        .verify_and_consume_pending_confirmation(
+            "pending-exact-1",
+            &hash_b,
+            "nonce-exact-1",
+            "allow"
+        )
+        .is_err());
+    assert!(db
+        .verify_and_consume_pending_confirmation(
+            "pending-exact-1",
+            &hash_redacted,
+            "nonce-exact-1",
+            "allow",
+        )
+        .is_err());
+    assert!(db
+        .verify_and_consume_pending_confirmation("pending-exact-1", &hash_a, "wrong-nonce", "allow")
+        .is_err());
+    assert_eq!(db.list_pending_confirmations(&repo_id).unwrap().len(), 1);
+
+    // Only the exact intended args_hash + matching nonce consumes the pending approval.
+    let consumed = db
+        .verify_and_consume_pending_confirmation(
+            "pending-exact-1",
+            &hash_a,
+            "nonce-exact-1",
+            "allow",
+        )
+        .unwrap();
+    assert_eq!(consumed.args_hash, hash_a);
+    assert!(consumed.args_canonical.is_empty());
+    assert!(db.list_pending_confirmations(&repo_id).unwrap().is_empty());
+
+    // Replaying the same exact hash + nonce is rejected.
+    assert!(db
+        .verify_and_consume_pending_confirmation(
+            "pending-exact-1",
+            &hash_a,
+            "nonce-exact-1",
+            "allow",
+        )
+        .is_err());
+
+    // Completed telemetry ignores any raw arguments passed by callers.
+    let raw_marker = r#"{"query":"HARMLESS_DOTENV_MARKER_ABC123456"}"#;
+    let marker_hash = sha(raw_marker);
+    db.record_completed_invocation(
+        &repo_id,
+        "mcp-client",
+        "default",
+        "repository_search",
+        &marker_hash,
+        raw_marker,
+        false,
+        None,
+        Some(64),
+    )
+    .unwrap();
+    drop(db);
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT id, args_hash, args_canonical, finished_at FROM tool_invocations")
+        .unwrap();
+    let rows: Vec<(String, String, String, Option<String>)> = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    for (_, stored_hash, stored_canonical, finished_at) in &rows {
+        assert!(finished_at.is_some());
+        assert!(
+            stored_canonical.is_empty(),
+            "completed telemetry row must not persist raw args_canonical"
+        );
+        assert!(stored_hash == &hash_a || stored_hash == &marker_hash);
+    }
+
+    // Legacy pending rows containing raw args_canonical are also scrubbed on consumption.
+    let legacy_hash = sha(r#"{"cmd":"legacy"}"#);
+    let actor_id: String = conn
+        .query_row("SELECT id FROM actors LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    conn.execute(
+        "INSERT INTO tool_invocations (
+            id, repo_id, actor_id, tool, args_hash, args_canonical,
+            started_at, finished_at, is_error, error_code, warning_json
+         ) VALUES (?1, ?2, ?3, 'legacy_tool', ?4, ?5, '2026-11-21T00:00:00Z', NULL, 0, NULL, ?6)",
+        rusqlite::params![
+            "pending-legacy",
+            repo_id.as_str(),
+            actor_id,
+            legacy_hash,
+            r#"{"legacy":"RAW_LEGACY_PAYLOAD"}"#,
+            r#"{"confirmation_nonce":"nonce-legacy","status":"pending"}"#,
+        ],
+    )
+    .unwrap();
+    drop(stmt);
+    drop(conn);
+
+    let db = IndexDatabase::open(&db_path).unwrap();
+    let legacy_consumed = db
+        .verify_and_consume_pending_confirmation(
+            "pending-legacy",
+            &legacy_hash,
+            "nonce-legacy",
+            "allow",
+        )
+        .unwrap();
+    assert_eq!(legacy_consumed.args_hash, legacy_hash);
+    assert!(legacy_consumed.args_canonical.is_empty());
+    drop(db);
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let scrubbed: String = conn
+        .query_row(
+            "SELECT args_canonical FROM tool_invocations WHERE id = 'pending-legacy'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(scrubbed.is_empty());
+    drop(conn);
+
+    let raw_bytes = fs::read(&db_path).unwrap();
+    let raw_lossy = String::from_utf8_lossy(&raw_bytes);
+    for forbidden in [
+        secret_a.as_str(),
+        "deploy-prod",
+        "HARMLESS_DOTENV_MARKER_ABC123456",
+    ] {
+        assert!(
+            !raw_lossy.contains(forbidden),
+            "raw argument `{forbidden}` leaked into SQLite database"
+        );
+    }
+}

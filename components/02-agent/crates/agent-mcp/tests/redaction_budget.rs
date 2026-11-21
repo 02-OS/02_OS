@@ -156,3 +156,74 @@ fn context_tool_budgets_the_serialized_payload() {
         assert!(memory["evidence"].is_array());
     }
 }
+
+#[test]
+fn tool_telemetry_omits_raw_arguments() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let repo = Repository::init(root).unwrap();
+    let sig = git2::Signature::now("Tester", "test@02os.org").unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn telemetry_probe() {}\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("src/lib.rs")).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+
+    let marker = "HARMLESS_DOTENV_MARKER_ABC123456";
+    let custom_key = "sk_test_MCP_ARG_LEAK_PROOF_1234567890";
+    let token = format!("ghp_{}", "z".repeat(36));
+    let password = "fixture-secret-password-987654";
+    let pem =
+        "-----BEGIN RSA PRIVATE KEY-----\nFIXTURE_PRIVATE_KEY_BODY\n-----END RSA PRIVATE KEY-----";
+    let first = call_tool(
+        root,
+        "repository_search",
+        &json!({
+            "query": format!("{marker} {custom_key} token {token} and {pem}"),
+            "password": password,
+        }),
+    );
+    assert!(!first.is_error, "{}", first.content[0].text);
+
+    let second = call_tool(
+        root,
+        "repository_search",
+        &json!({
+            "query": "ARBITRARY_RAW_QUERY_PAYLOAD_998877",
+        }),
+    );
+    assert!(!second.is_error, "{}", second.content[0].text);
+
+    let repo_id = RepoId::from_path(root);
+    let db_path = StoragePaths::repo_db_path(&repo_id).unwrap();
+    let db = IndexDatabase::open(&db_path).unwrap();
+    let token_counts = db.list_token_counts(&repo_id).unwrap();
+    let search_stats = token_counts
+        .iter()
+        .find(|row| row.tool == "repository_search")
+        .expect("expected completed telemetry row for repository_search");
+    assert_eq!(search_stats.invocations, 2);
+    drop(db);
+
+    let raw = fs::read(&db_path).unwrap();
+    let raw_lossy = String::from_utf8_lossy(&raw);
+    for forbidden in [
+        marker,
+        custom_key,
+        token.as_str(),
+        password,
+        "FIXTURE_PRIVATE_KEY_BODY",
+        "ARBITRARY_RAW_QUERY_PAYLOAD_998877",
+        "\"query\"",
+        "\"password\"",
+    ] {
+        assert!(
+            !raw_lossy.contains(forbidden),
+            "raw tool argument `{forbidden}` leaked into SQLite telemetry"
+        );
+    }
+    let _ = fs::remove_dir_all(StoragePaths::repo_dir(&repo_id).unwrap());
+}

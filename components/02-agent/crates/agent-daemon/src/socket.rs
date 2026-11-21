@@ -74,27 +74,46 @@ impl DaemonSocket {
         }
     }
 
-    /// True when the connected peer process is an `02 mcp` stdio server (`#132`).
+    /// True when the connected peer process is an `02 mcp` (or `02agent mcp`) stdio server (`#132`).
     pub fn peer_is_mcp_server(stream: &UnixStream) -> bool {
         let Ok((_, pid)) = Self::peer_cred(stream) else {
             return true;
         };
         if pid <= 0 {
-            return false;
+            return true;
         }
         let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
             return false;
         };
+        let exe = fs::read_link(format!("/proc/{pid}/exe")).ok();
+        Self::peer_process_is_mcp_server(&cmdline, exe.as_deref())
+    }
+
+    pub(crate) fn peer_process_is_mcp_server(cmdline: &[u8], exe: Option<&Path>) -> bool {
         let args: Vec<String> = cmdline
             .split(|b| *b == 0)
             .filter(|part| !part.is_empty())
             .map(|part| String::from_utf8_lossy(part).into_owned())
             .collect();
-        args.iter().any(|arg| arg == "mcp")
-            && args
-                .first()
-                .map(|bin| bin.ends_with("/02") || bin == "02")
-                .unwrap_or(false)
+        let is_mcp_subcommand = args
+            .iter()
+            .skip(1)
+            .find(|arg| !arg.starts_with('-'))
+            .is_some_and(|arg| arg == "mcp");
+        if !is_mcp_subcommand {
+            return false;
+        }
+        let argv0_matches = args
+            .first()
+            .map(|bin| {
+                bin == "02" || bin.ends_with("/02") || bin == "02agent" || bin.ends_with("/02agent")
+            })
+            .unwrap_or(false);
+        let exe_matches = exe
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "02" || name == "02agent");
+        argv0_matches || exe_matches
     }
 
     /// Bind to Unix domain socket, replacing only a stale socket we own.
@@ -183,5 +202,68 @@ impl DaemonSocket {
             }
         }
         let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DaemonSocket;
+    use std::path::Path;
+
+    #[test]
+    fn detects_02_and_02agent_mcp_cmdlines() {
+        assert!(DaemonSocket::peer_process_is_mcp_server(b"02\0mcp\0", None));
+        assert!(DaemonSocket::peer_process_is_mcp_server(
+            b"/usr/bin/02\0mcp\0",
+            None
+        ));
+        assert!(DaemonSocket::peer_process_is_mcp_server(
+            b"/usr/bin/02\0--json\0mcp\0",
+            None
+        ));
+        assert!(DaemonSocket::peer_process_is_mcp_server(
+            b"02agent\0mcp\0",
+            None
+        ));
+        assert!(DaemonSocket::peer_process_is_mcp_server(
+            b"/usr/bin/02agent\0mcp\0",
+            None
+        ));
+        assert!(DaemonSocket::peer_process_is_mcp_server(
+            b"/usr/bin/02agent\0--json\0mcp\0",
+            None
+        ));
+        assert!(DaemonSocket::peer_process_is_mcp_server(
+            b"/tmp/custom-alias\0mcp\0",
+            Some(Path::new("/usr/bin/02"))
+        ));
+        assert!(DaemonSocket::peer_process_is_mcp_server(
+            b"/tmp/custom-alias\0mcp\0",
+            Some(Path::new("/usr/bin/02agent"))
+        ));
+        assert!(!DaemonSocket::peer_process_is_mcp_server(
+            b"/usr/bin/02\0status\0",
+            None
+        ));
+        assert!(!DaemonSocket::peer_process_is_mcp_server(
+            b"/usr/bin/02\0search\0mcp\0",
+            None
+        ));
+        assert!(!DaemonSocket::peer_process_is_mcp_server(
+            b"/usr/bin/02agent\0search\0mcp\0",
+            None
+        ));
+        assert!(!DaemonSocket::peer_process_is_mcp_server(
+            b"/usr/bin/other02\0mcp\0",
+            None
+        ));
+        assert!(!DaemonSocket::peer_process_is_mcp_server(
+            b"/usr/bin/other02agent\0mcp\0",
+            None
+        ));
+        assert!(!DaemonSocket::peer_process_is_mcp_server(
+            b"/usr/bin/gnome-shell\0",
+            Some(Path::new("/usr/bin/gnome-shell"))
+        ));
     }
 }

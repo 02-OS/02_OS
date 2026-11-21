@@ -1516,6 +1516,8 @@ impl IndexDatabase {
     }
 
     /// Register an open pending tool invocation bound to a random confirmation nonce (#132).
+    ///
+    /// Pending rows bind to the exact `args_hash` digest without persisting raw arguments.
     #[allow(clippy::too_many_arguments)]
     pub fn start_pending_invocation(
         &self,
@@ -1524,10 +1526,16 @@ impl IndexDatabase {
         actor_name: &str,
         tool: &str,
         args_hash: &str,
-        args_canonical: &str,
+        _args_canonical: &str,
         confirmation_nonce: &str,
         pending_id: &str,
     ) -> Result<()> {
+        let normalized_hash = args_hash.trim().to_ascii_lowercase();
+        if normalized_hash.len() != 64 || !normalized_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(AgentError::Security(
+                "pending invocation args_hash must be a 64-character hex digest".into(),
+            ));
+        }
         let actor_id = self.upsert_actor(repo_id, actor_kind, actor_name, None)?;
         let meta = json!({
             "confirmation_nonce": confirmation_nonce,
@@ -1539,14 +1547,13 @@ impl IndexDatabase {
                 "INSERT INTO tool_invocations (
                     id, repo_id, actor_id, tool, args_hash, args_canonical,
                     started_at, finished_at, is_error, error_code, warning_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 0, NULL, ?8)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, NULL, 0, NULL, ?7)",
                 params![
                     pending_id,
                     repo_id.as_str(),
                     actor_id,
                     tool,
-                    args_hash.trim().to_ascii_lowercase(),
-                    args_canonical,
+                    normalized_hash,
                     Utc::now().to_rfc3339(),
                     meta
                 ],
@@ -1556,6 +1563,9 @@ impl IndexDatabase {
     }
 
     /// Record a completed MCP/CLI tool invocation and optional token budget into v5 telemetry (#153).
+    ///
+    /// Completed telemetry records only the `args_hash` digest and intentionally omits raw
+    /// canonical arguments from `tool_invocations.args_canonical`.
     #[allow(clippy::too_many_arguments)]
     pub fn record_completed_invocation(
         &self,
@@ -1564,7 +1574,7 @@ impl IndexDatabase {
         actor_name: &str,
         tool: &str,
         args_hash: &str,
-        args_canonical: &str,
+        _args_canonical: &str,
         is_error: bool,
         error_code: Option<&str>,
         tokens: Option<u64>,
@@ -1584,14 +1594,13 @@ impl IndexDatabase {
                 "INSERT INTO tool_invocations (
                     id, repo_id, actor_id, tool, args_hash, args_canonical,
                     started_at, finished_at, is_error, error_code, warning_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?6, ?7, ?8, ?9)",
                 params![
                     random_id,
                     repo_id.as_str(),
                     actor_id,
                     tool,
-                    args_hash,
-                    args_canonical,
+                    args_hash.trim().to_ascii_lowercase(),
                     now,
                     if is_error { 1 } else { 0 },
                     error_code,
@@ -1732,7 +1741,7 @@ impl IndexDatabase {
                 .conn
                 .execute(
                     "UPDATE tool_invocations
-                     SET finished_at = ?2, is_error = ?3, error_code = ?4, warning_json = ?5
+                     SET args_canonical = '', finished_at = ?2, is_error = ?3, error_code = ?4, warning_json = ?5
                      WHERE id = ?1 AND finished_at IS NULL",
                     params![
                         pending_id,
@@ -1754,12 +1763,13 @@ impl IndexDatabase {
                     "pending approval was already consumed".into(),
                 ));
             }
+            let _ = args_canonical;
             Ok(PendingConfirmation {
                 id: pending_id.to_string(),
                 repo_id,
                 tool,
                 args_hash: expected_hash,
-                args_canonical,
+                args_canonical: String::new(),
                 nonce: expected_nonce,
                 created_at,
             })
