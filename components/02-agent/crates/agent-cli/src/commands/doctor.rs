@@ -55,10 +55,12 @@ pub fn execute(json_output: bool) -> Result<()> {
         .as_ref()
         .map(|(info, _, _)| crate::commands::watch::watching(&info.root_path))
         .transpose()?;
+    let sqlite_version = agent_index::sqlite_version();
     if json_output {
         let out = json!({
             "is_root": is_root,
             "git_version": git_version,
+            "sqlite_version": sqlite_version,
             "storage_dir": data_dir,
             "storage_writable": storage_writable,
             "live_environment": live_env,
@@ -87,6 +89,7 @@ pub fn execute(json_output: bool) -> Result<()> {
             }
         );
         println!("  • Git Engine:       {}", git_version);
+        println!("  • SQLite Engine:    {} (bundled)", sqlite_version);
         println!(
             "  • XDG Data Dir:     {} (Writable: {})",
             data_dir.display(),

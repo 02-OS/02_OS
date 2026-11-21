@@ -25,5 +25,15 @@ pub use graph::{
 pub use scanner::{RepoScanner, ScannedFile};
 pub use search::{FtsSearcher, SearchResult};
 
+/// Version string of the SQLite engine compiled into the runtime (`sqlite3_libversion`).
+pub fn sqlite_version() -> &'static str {
+    rusqlite::version()
+}
+
+/// Numeric version of the SQLite engine compiled into the runtime (`sqlite3_libversion_number`).
+pub fn sqlite_version_number() -> i32 {
+    rusqlite::version_number()
+}
+
 #[cfg(test)]
 mod migrate_tests;
